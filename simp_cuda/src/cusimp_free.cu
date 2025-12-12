@@ -247,16 +247,20 @@ namespace cusimp_free
         if (fabsf(p.x - q.x) > eps || fabsf(p.y - q.y) > eps || fabsf(p.z - q.z) > eps)
             return;
 
-        // collapsing start
-        // FIX 2: Check if vertex is already collapsed/deleted to avoid races
+        // FIX 2: Check if vertex is already collapsed/deleted BEFORE atomic operation to avoid races
         if (sp.pts_occ[edge.v] == 0)
             return;
 
+        // FIX 3: Use atomicCAS to safely claim this collapse operation
+        int old_occ = atomicCAS(&sp.pts_occ[edge.v], 1, 0);
+        if (old_occ == 0)
+            return; // Another thread already collapsed this vertex
+
+        // collapsing start - now safe because we own this vertex
         int pos = atomicAdd(sp.n_collapsed, 1);
         sp.collapsed_edge_idx[pos] = edge_index;
 
         sp.points[edge.v] = {0, 0, 0};
-        sp.pts_occ[edge.v] = 0;
 
         int first = sp.first_near_tris[edge.u];
         int last = sp.first_near_tris[edge.u + 1];
@@ -891,15 +895,17 @@ namespace cusimp_free
     }
     // --- KERNEL FIXES START ---
 
-    // Just copies raw indices from tmp to the main list.
+    // Copies raw indices from tmp to the main list for the current batch.
     // Does NOT use pts_map (which is invalid during the loop).
-    __global__ void rearrange_index_of_undo_vertices(CUSimp_Free sp, int first)
+    // batch_size: number of vertices in current batch (n_verts_undo or 2*h_n_edges_undo)
+    __global__ void rearrange_index_of_undo_vertices(CUSimp_Free sp, int first, int batch_size)
     {
         int index = blockIdx.x * blockDim.x + threadIdx.x;
         // Check bounds based on current batch size
-        if (index >= (sp.n_vertices_undo - first))
+        if (index >= batch_size)
             return;
 
+        // Read from tmp buffer which contains the current batch only
         int idx_undo_vertices = sp.tmp_vertices_undo_list[index];
         sp.vertices_undo_list[first + index] = idx_undo_vertices;
     }
@@ -940,7 +946,8 @@ namespace cusimp_free
             n_vertices_undo += n_verts_undo;
 
             // Populate list with previous undo vertices (raw copy)
-            rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
+            // FIX: Use batch_size (n_verts_undo) not total accumulated count
+            rearrange_index_of_undo_vertices<<<(n_verts_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo, n_verts_undo);
             first_n_vertices_undo += n_verts_undo;
         }
         else
@@ -1044,6 +1051,8 @@ namespace cusimp_free
 
         bool isIntersect = selfx::self_intersect(this, n_pts, n_tris, epsilon);
         CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
+        // FIX: Clear tmp buffer before get_undo_candidate_kernel to prevent stale data
+        CHECK_CUDA(cudaMemset(tmp_vertices_undo_list, 0, 8 * (allocated_pts + 1) * sizeof(int)));
         get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
         cudaDeviceSynchronize();
 
@@ -1055,9 +1064,19 @@ namespace cusimp_free
         {
             i++;
             undo_collapse_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+            // FIX: Add sync after undo_collapse_kernel
+            cudaDeviceSynchronize();
 
-            // Populate list (raw copy only)
-            rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
+            // FIX: Bounds check before kernel launch
+            int batch_size = 2 * h_n_edges_undo;
+            if (first_n_vertices_undo + batch_size > 8 * allocated_pts) {
+                fprintf(stderr, "ERROR: Undo buffer overflow! %d + %d > %ld\n",
+                        first_n_vertices_undo, batch_size, 8 * allocated_pts);
+                break;
+            }
+
+            // Populate list (raw copy only) - FIX: Use batch_size not total count
+            rearrange_index_of_undo_vertices<<<(batch_size + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo, batch_size);
 
             cudaDeviceSynchronize();
             first_n_vertices_undo += 2 * h_n_edges_undo;
@@ -1065,6 +1084,8 @@ namespace cusimp_free
             bool afterUndo = selfx::self_intersect(this, n_pts, n_tris, epsilon);
             cudaDeviceSynchronize();
             CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
+            // FIX: Clear tmp buffer before get_undo_candidate_kernel
+            CHECK_CUDA(cudaMemset(tmp_vertices_undo_list, 0, 8 * (allocated_pts + 1) * sizeof(int)));
             get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
             cudaDeviceSynchronize();
             cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost);
