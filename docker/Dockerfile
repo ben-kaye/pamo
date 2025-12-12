@@ -1,13 +1,20 @@
 FROM nvcr.io/nvidia/pytorch:25.08-py3
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG USER_ID=1000
+ARG GROUP_ID=1000
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
+RUN usermod -u $USER_ID -g $GROUP_ID ubuntu && usermod -aG sudo ubuntu && echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
 WORKDIR /workspace
+
+RUN chown -R ubuntu:ubuntu /workspace
 
 # Set CUDA architectures for Blackwell (RTX 50 series) support
 ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;9.0;10.0;12.0"
@@ -32,6 +39,8 @@ RUN cd simp_cuda && FORCE_CUDA=1 pip install --no-build-isolation .
 
 # Install safe_project (stage 3: safe projection)
 RUN cd simp_cuda/safe_project && FORCE_CUDA=1 pip install --no-build-isolation .
+
+USER ubuntu
 
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["bash"]

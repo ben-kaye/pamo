@@ -1,0 +1,26 @@
+services:
+  pamo-debug:
+    image: pamo
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        USER_ID: ${UID}
+        GROUP_ID: ${GID}
+    volumes:
+      - .:/workspace/pamo
+    working_dir: /workspace/pamo
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
+      - CUDA_LAUNCH_BLOCKING=1
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
