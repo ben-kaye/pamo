@@ -160,6 +160,17 @@ namespace selfx{
                          thrust::make_counting_iterator<std::size_t>(0),
                          thrust::make_counting_iterator<std::size_t>(num_faces),
                          [V_d_raw, F_d_raw, triangles_d_raw] __device__(std::size_t idx){
+                            // FIX: Added check for deleted triangles to prevent accessing V_d_raw[-1]
+                            if(F_d_raw[idx].i < 0 || F_d_raw[idx].j < 0 || F_d_raw[idx].k < 0) {
+                                // Write dummy data to avoid uninitialized memory access later
+                                Triangle<float3> tri;
+                                tri.v0 = make_float3(0.0f, 0.0f, 0.0f);
+                                tri.v1 = make_float3(0.0f, 0.0f, 0.0f);
+                                tri.v2 = make_float3(0.0f, 0.0f, 0.0f);
+                                triangles_d_raw[idx] = tri;
+                                return;
+                            }
+                            
                             Triangle<float3> tri;
                             int v0_row = F_d_raw[idx].i;
                             int v1_row = F_d_raw[idx].j;

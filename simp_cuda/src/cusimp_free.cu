@@ -280,7 +280,8 @@ namespace cusimp_free
             return;
 
         Triangle<int> tri = sp.triangles[tri_index];
-        if (tri.i == -1 && tri.j == -1 && tri.k == -1)
+        // FIX: Strict check. If ANY index is negative, ignore the triangle.
+        if (tri.i < 0 || tri.j < 0 || tri.k < 0)
             return;
 
         atomicAdd(&sp.first_near_tris[tri.i], 1);
@@ -295,7 +296,8 @@ namespace cusimp_free
             return;
 
         Triangle<int> tri = sp.triangles[tri_index];
-        if (tri.i == -1 && tri.j == -1 && tri.k == -1)
+        // FIX: Strict check.
+        if (tri.i < 0 || tri.j < 0 || tri.k < 0)
             return;
 
         sp.near_tris[sp.first_near_tris[tri.i] + atomicAdd(&sp.near_offset[tri.i], 1)] = tri_index;
@@ -310,8 +312,10 @@ namespace cusimp_free
             return;
 
         Triangle<int> tri = sp.triangles[tri_index];
-        if (tri.i == -1 && tri.j == -1 && tri.k == -1)
+        // FIX: Strict check.
+        if (tri.i < 0 || tri.j < 0 || tri.k < 0)
             return;
+            
         sp.first_edge[tri_index] += (tri.i > tri.j) + (tri.j > tri.k) + (tri.k > tri.i);
     }
 
@@ -322,7 +326,8 @@ namespace cusimp_free
             return;
 
         Triangle<int> tri = sp.triangles[tri_index];
-        if (tri.i == -1 && tri.j == -1 && tri.k == -1)
+        // FIX: Strict check.
+        if (tri.i < 0 || tri.j < 0 || tri.k < 0)
             return;
 
         int first = sp.first_edge[tri_index];

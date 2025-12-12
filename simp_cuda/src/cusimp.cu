@@ -169,56 +169,63 @@ namespace cusimp
         }
     }
 
-    __global__ void count_near_tris_kernel(CUSimp sp)
+__global__ void count_near_tris_kernel(CUSimp sp)
     {
         int tri_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (tri_index >= sp.n_tris)
             return;
 
         Triangle<int> tri = sp.triangles[tri_index];
-        if (tri.i == -1 && tri.j == -1 && tri.k == -1)
+        
+        // FIX: Strict check. If ANY index is negative, ignore the triangle.
+        // Accessing first_near_tris[-1] causes the crash.
+        if (tri.i < 0 || tri.j < 0 || tri.k < 0)
             return;
 
         atomicAdd(&sp.first_near_tris[tri.i], 1);
         atomicAdd(&sp.first_near_tris[tri.j], 1);
         atomicAdd(&sp.first_near_tris[tri.k], 1);
     }
-
-    __global__ void create_near_tris_kernel(CUSimp sp)
+__global__ void create_near_tris_kernel(CUSimp sp)
     {
         int tri_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (tri_index >= sp.n_tris)
             return;
 
         Triangle<int> tri = sp.triangles[tri_index];
-        if (tri.i == -1 && tri.j == -1 && tri.k == -1)
+        
+        // FIX: Strict check.
+        if (tri.i < 0 || tri.j < 0 || tri.k < 0)
             return;
 
         sp.near_tris[sp.first_near_tris[tri.i] + atomicAdd(&sp.near_offset[tri.i], 1)] = tri_index;
         sp.near_tris[sp.first_near_tris[tri.j] + atomicAdd(&sp.near_offset[tri.j], 1)] = tri_index;
         sp.near_tris[sp.first_near_tris[tri.k] + atomicAdd(&sp.near_offset[tri.k], 1)] = tri_index;
     }
-
-    __global__ void count_edge_kernel(CUSimp sp)
+__global__ void count_edge_kernel(CUSimp sp)
     {
         int tri_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (tri_index >= sp.n_tris)
             return;
 
         Triangle<int> tri = sp.triangles[tri_index];
-        if (tri.i == -1 && tri.j == -1 && tri.k == -1)
+        
+        // FIX: Strict check.
+        if (tri.i < 0 || tri.j < 0 || tri.k < 0)
             return;
+            
         sp.first_edge[tri_index] += (tri.i > tri.j) + (tri.j > tri.k) + (tri.k > tri.i);
     }
-
-    __global__ void create_edge_kernel(CUSimp sp)
+__global__ void create_edge_kernel(CUSimp sp)
     {
         int tri_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (tri_index >= sp.n_tris)
             return;
 
         Triangle<int> tri = sp.triangles[tri_index];
-        if (tri.i == -1 && tri.j == -1 && tri.k == -1)
+        
+        // FIX: Strict check.
+        if (tri.i < 0 || tri.j < 0 || tri.k < 0)
             return;
 
         int first = sp.first_edge[tri_index];
