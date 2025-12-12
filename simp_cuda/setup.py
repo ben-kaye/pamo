@@ -17,9 +17,9 @@ def get_extensions():
     this_dir = os.path.dirname(os.path.abspath(__file__))
     extensions_dir = os.path.join(this_dir, "pamo")
 
-    main_file = [os.path.join(this_dir, "src", "pybind.cpp")]
+    # All .cu files (including pybind.cu) are picked up by glob
     source_cuda = glob.glob(os.path.join(this_dir, "src", "*.cu"))
-    sources = main_file
+    sources = []
     extension = CppExtension
 
     define_macros = []

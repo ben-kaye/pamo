@@ -18,6 +18,9 @@ def wp_slice(a: wp.array, start, end):
 
     assert a.is_contiguous
     assert 0 <= start <= end <= a.shape[0]
+    
+    # CHANGE: Removed 'owner=False'. 
+    # In Warp 1.0+, passing 'ptr' automatically creates a non-owning view.
     return wp.array(
         ptr=a.ptr + start * a.strides[0],
         dtype=a.dtype,
@@ -25,9 +28,7 @@ def wp_slice(a: wp.array, start, end):
         strides=a.strides,
         device=a.device,
         copy=False,
-        owner=False,
     )
-    
 
 def convert_to_wp_array(
     a: Union[np.ndarray, torch.Tensor, wp.array, list], dtype=None, device=None

@@ -23,13 +23,13 @@
 #include <bitset>
 
 // For 32-bit numbers
-std::string toBinary32(unsigned int number)
+inline std::string toBinary32(unsigned int number)
 {
     return std::bitset<32>(number).to_string();
 }
 
 // For 64-bit numbers
-std::string toBinary64(unsigned long long int number)
+inline std::string toBinary64(unsigned long long int number)
 {
     return std::bitset<64>(number).to_string();
 }

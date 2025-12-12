@@ -10,5 +10,6 @@ setup(
         'scipy>=1.12.0',
         'trimesh>=4.0.10',
         'libigl>=2.5.1',
+        # 'spd_ext'
     ],
 )
