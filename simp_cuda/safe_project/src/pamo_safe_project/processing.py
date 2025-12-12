@@ -46,6 +46,7 @@ def process(
         system = Stage3System(config, "cuda:0")
     else:
         system.clear()
+        wp.synchronize()  # Ensure Warp cleanup completes before returning to PyTorch
 
     system_init_time = time.time() - time_start
     logger.debug(f"System initialized in {system_init_time:.3f}s")

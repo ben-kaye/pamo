@@ -52,10 +52,22 @@ class PaMO(nn.Module):
         self.margin = self.band * 2 + 1 #2
         self.target_faces = None
 
+    def __del__(self):
+        """Cleanup Stage3System and release Warp memory when PaMO instance is deleted."""
+        if hasattr(self, 'use_stage3') and self.use_stage3:
+            if hasattr(self, 'system'):
+                try:
+                    # Clear the system
+                    self.system.clear()
+                    # Delete the system to release Warp arrays
+                    del self.system
+                except Exception as e:
+                    # Silently fail during cleanup to avoid errors in destructor
+                    pass
+
     def tri_area(self, v0, v1, v2):
         cross_prod = torch.cross(v1 - v0, v2 - v0)
         return 0.5 * torch.norm(cross_prod, dim=1)
-
 
     def preprocess_mesh(self, points, triangles, band, margin):
         tris = points[triangles]
