@@ -3,44 +3,77 @@ FROM nvcr.io/nvidia/pytorch:25.08-py3
 ARG DEBIAN_FRONTEND=noninteractive
 ARG USER_ID=1000
 ARG GROUP_ID=1000
+ARG USER_NAME=ubuntu
 
-# System dependencies
+# 1. System dependencies
+# Added 'ninja-build' which is critical for fast CUDA extension compilation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     sudo \
+    ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-RUN usermod -u $USER_ID -g $GROUP_ID ubuntu && usermod -aG sudo ubuntu && echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+# 2. User Setup (Robust)
+# We check if the user exists; if not, we create it.
+# If the group exists, we reuse it; otherwise, we create it.
+RUN if getent group $GROUP_ID; then \
+        groupmod -n $USER_NAME $(getent group $GROUP_ID | cut -d: -f1); \
+    else \
+        groupadd -g $GROUP_ID $USER_NAME; \
+    fi && \
+    if id -u $USER_ID >/dev/null 2>&1; then \
+        usermod -l $USER_NAME -g $GROUP_ID -d /home/$USER_NAME -m $(getent passwd $USER_ID | cut -d: -f1); \
+    else \
+        useradd -m -u $USER_ID -g $GROUP_ID -s /bin/bash $USER_NAME; \
+    fi && \
+    usermod -aG sudo $USER_NAME && \
+    echo "$USER_NAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 WORKDIR /workspace
+ENV TORCH_CUDA_ARCH_LIST="12.0"
+ENV FORCE_CUDA=1
+# Fix for common header issues in geometric extensions
+ENV MAX_JOBS=4
 
-RUN chown -R ubuntu:ubuntu /workspace
-
-# Set CUDA architectures for Blackwell (RTX 50 series) support
-ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;9.0;10.0;12.0"
-
-# Python dependencies (CUDA extensions require FORCE_CUDA=1 and --no-build-isolation)
+# 4. Python Fundamentals
+# Install numpy 1.x FIRST, as subsequent compilations (diso/cumesh) may need numpy headers.
 RUN pip install --upgrade pip && \
-    pip install warp-lang --pre --extra-index-url https://pypi.nvidia.com && \
-    pip install --no-build-isolation git+https://github.com/eliphatfs/cumesh2sdf.git && \
-    FORCE_CUDA=1 pip install --no-build-isolation git+https://github.com/seonghunn/pdmc.git && \
-    FORCE_CUDA=1 pip install --no-build-isolation diso==0.1.4 && \
-    pip install libigl==2.5.1 numpy==1.* trimesh==4.4.*
+    pip install "numpy<2.0" ninja
 
-ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+# 5. Compiled Extensions (Layered for caching)
+# We separate these so if one fails, you don't rebuild them all.
+RUN pip install --no-build-isolation git+https://github.com/eliphatfs/cumesh2sdf.git
 
-# Copy local pamo source (with fixes applied)
-COPY . /workspace/pamo
+RUN pip install --no-build-isolation git+https://github.com/seonghunn/pdmc.git
+
+# diso is sensitive to CUDA versions, ensuring it runs isolated
+RUN FORCE_CUDA=1 pip install --no-build-isolation diso==0.1.4
+
+# 6. Standard Libs
+RUN pip install libigl==2.5.1 trimesh==4.4.*
+
+# 7. Local Source Setup
+# We change ownership explicitly during the copy to avoid permission issues
+COPY --chown=$USER_NAME:$USER_NAME . /workspace/pamo
 
 WORKDIR /workspace/pamo
 
-# Install simp_cuda (stage 2: simplification)
-RUN cd simp_cuda && FORCE_CUDA=1 pip install --no-build-isolation .
+# 8. Install Local Packages
+# Using --no-deps is often safer here if you've already handled dependencies above, 
+# but we'll stick to standard install to catch missing ones.
+RUN cd simp_cuda && \
+    FORCE_CUDA=1 pip install --no-build-isolation .
 
-# Install safe_project (stage 3: safe projection)
-RUN cd simp_cuda/safe_project && FORCE_CUDA=1 pip install --no-build-isolation .
+RUN cd simp_cuda/safe_project && \
+    FORCE_CUDA=1 pip install --no-build-isolation .
 
-USER ubuntu
+# 9. Final Configuration
+# DANGEROUS: ENV LD_PRELOAD...
+# Instead of setting this globally (which breaks system tools), 
+# we rely on the path precedence or set it strictly for the entrypoint if absolutely necessary.
+# If libigl fails without it, prefer setting it in a shell alias or specific run command.
+
+USER $USER_NAME
 
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["bash"]

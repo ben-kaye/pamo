@@ -9,6 +9,7 @@ services:
         GROUP_ID: ${GID}
     volumes:
       - .:/workspace/pamo
+      - /datasets:/datasets
     working_dir: /workspace/pamo
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
