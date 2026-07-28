@@ -32,7 +32,7 @@ class PaMO(nn.Module):
         scale = 1.0 / diameter
         self.gt_mesh = copy.deepcopy(input_mesh)
 
-        # Phase B #5: stage 3 system + stage 1 DMC are built on first use.
+        # Stage 3 system + stage 1 DMC are built on first use.
         self.config = None
         self.system = None
         self.vol2mesh = None
@@ -113,10 +113,8 @@ class PaMO(nn.Module):
 
     def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3, iter=1000000,
             min_faces=None, min_verts=None):
-        # min_faces is a floor on the *face* target (not vertex count).
-        # Default 0 so ratio alone controls the target; the old 1e10 default
-        # disabled simplification (HANDOFF2 §3.4).
-        # min_verts is a deprecated alias for min_faces (pre-rename API).
+        # min_faces floors the *face* target (not vertex count). Default 0 so
+        # ratio alone sets the target. min_verts is a deprecated alias.
         if min_faces is not None and min_verts is not None:
             raise TypeError(
                 "PaMO.run() got both min_faces and min_verts; "
@@ -138,7 +136,7 @@ class PaMO(nn.Module):
         tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(points, triangles, self.band, self.margin)
         tris = torch.tensor(tris, dtype=torch.float32, device='cuda:0')
 
-        # stage1 (Remeshing) — Phase B #5: DMC constructed on first remesh
+        # stage1 (Remeshing)
         if self.use_stage1:
             self._ensure_stage1()
             # Default 256
@@ -200,7 +198,7 @@ class PaMO(nn.Module):
         faces = faces.cpu().numpy()
         print(f"Time for Simplification: {end_stage2 - start_stage2} sec")
         
-        # stage3 (Safe projection) — Phase B #5: system built on first projection
+        # stage3 (Safe projection)
         if self.use_stage3:
             self._ensure_stage3()
             stage2_mesh = trimesh.Trimesh(vertices=verts, faces=faces)

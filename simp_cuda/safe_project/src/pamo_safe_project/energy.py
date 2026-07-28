@@ -686,7 +686,7 @@ class HingeEnergyCalculator(EnergyCalculator):
         self._cap_edges = ME
 
     def preprocess(self, V, F):
-        """Discover hinges via sorted half-edge table (O(F log F)), not O(F^2)."""
+        """Discover hinges via sorted half-edge table (O(F log F))."""
         s = self.system
         c = s.config
 
@@ -867,7 +867,7 @@ class CollisionEnergyCalculator(EnergyCalculator):
         logger.warning(
             f"Number of contacts ({n_contacts}) exceeds contact capacity ({cap})"
         )
-        # Prefer growing the buffer (Phase B) over silently thinning the contact set.
+        # Prefer growing the buffer over silently thinning the contact set.
         if cap < c.max_blocks:
             # Need at least n_contacts slots; geometric growth may overshoot.
             need = min(c.max_blocks, max(n_contacts, int(cap * c.capacity_growth) if cap > 0 else n_contacts))

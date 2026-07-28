@@ -1,18 +1,24 @@
 #ifndef LBVH_QUERY_CUH
 #define LBVH_QUERY_CUH
 #define STACK_SIZE 256
-// Sentinel returned when the fixed DFS stack would overflow. Callers must treat
-// this as a hard failure: a partial candidate set can miss real intersections,
-// and the per-face max_candidates cap cannot detect that truncation.
+// Sentinel when the fixed DFS stack would overflow. Callers must hard-fail:
+// a truncated walk can miss real intersections.
 #define LBVH_STACK_OVERFLOW 0xFFFFFFFFu
 #include "predicator.cuh"
 
 namespace lbvh
 {
-    // face_i_raw[obj * face_i_stride] == -1 means deleted face (skip as partner).
-    // For packed Triangle<int> {i,j,k}, pass (int*)F and face_i_stride=3.
-    // max_candidates caps pairs counted/written per query.
-    // Returns LBVH_STACK_OVERFLOW if the fixed traversal stack fills.
+    // Fixed-stack DFS over the LBVH for AABB-overlap queries.
+    //
+    // Node encoding: object_idx != 0xFFFFFFFF means leaf (object = face index);
+    // otherwise left_idx/right_idx are internal children. Root is always node 0.
+    //
+    // face_i_raw[obj * face_i_stride] == -1 => deleted face (skip as partner).
+    // For packed Triangle<int>{i,j,k}, pass (int*)F and face_i_stride=3 so the
+    // first component of each triangle is the deleted-marker.
+    //
+    // max_candidates caps how many partner leaves are counted/written.
+    // Returns LBVH_STACK_OVERFLOW if the stack would exceed STACK_SIZE.
     template <typename Real, typename Objects, bool IsConst>
     __device__ unsigned int get_number_of_intersect_candidates(
         const detail::basic_device_bvh<Real, Objects, IsConst> &bvh,
@@ -27,12 +33,12 @@ namespace lbvh
 
         index_type stack[STACK_SIZE];
         index_type *stack_ptr = stack;
-        *stack_ptr++ = 0; // root node is always 0
+        *stack_ptr++ = 0; // root
 
         unsigned int num_found = 0;
         do
         {
-            // Fixed stack full: fail loudly rather than silently truncating.
+            // Need room for both children; fail rather than drop a subtree.
             if (stack_ptr - stack >= STACK_SIZE - 2)
                 return LBVH_STACK_OVERFLOW;
 
@@ -52,7 +58,7 @@ namespace lbvh
                         ++num_found;
                     }
                 }
-                else // the node is not a leaf.
+                else // internal: push child for later visit
                 {
                     *stack_ptr++ = L_idx;
                 }
@@ -69,7 +75,7 @@ namespace lbvh
                         ++num_found;
                     }
                 }
-                else // the node is not a leaf.
+                else
                 {
                     *stack_ptr++ = R_idx;
                 }
@@ -79,13 +85,11 @@ namespace lbvh
         return num_found;
     }
 
-
-
-    // dfs code ----------------------
-    // Writes (query_idx, obj_idx) pairs into outiter starting at index `first`.
-    // Each pair occupies 2 slots. Stops at max_candidates pairs.
-    // Returns LBVH_STACK_OVERFLOW if the fixed traversal stack fills (partial
-    // writes may have already occurred; host must not trust the list).
+    // Same DFS as get_number_of_intersect_candidates, but writes each accepted
+    // partner as (query_idx, obj_idx) into outiter starting at index `first`
+    // (2 slots per pair). Stops at max_candidates pairs.
+    // On stack overflow, partial writes may already exist — host must not trust
+    // the list and should treat the return as failure.
     template <typename Real, typename Objects, bool IsConst, typename OutputIterator>
     __device__ unsigned int query_device(
         const detail::basic_device_bvh<Real, Objects, IsConst> &bvh,

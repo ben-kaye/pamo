@@ -37,8 +37,8 @@ class Stage3System:
         self._init_counters()
         self._init_capacity_fields()
         self._init_scalar_arrays()
-        # Phase B #5: energy calculators are empty until first ensure/use
-        # when config.lazy_calculators (default True).
+        # Energy calculators may be empty until first ensure/use when
+        # config.lazy_calculators is True (default).
         self._init_energy_calcs()
 
         # CGSolver owns buffers that grow with ensure_capacity; construct now
@@ -150,8 +150,7 @@ class Stage3System:
         c = self.config
         growth = float(getattr(c, "capacity_growth", 2.0))
 
-        # Face/edge hard limits derived from max_particles / max_gt_particles
-        # (same formulas as the old eager allocator).
+        # Face/edge hard limits derived from max_particles / max_gt_particles.
         face_ceiling = c.max_particles * 2 + 1024
         edge_ceiling = face_ceiling // 2 * 3
         gt_face_ceiling = c.max_gt_particles * 2 + 1024
@@ -362,10 +361,9 @@ class Stage3System:
         NP, NT, NE = self.n_particles, self.n_triangles, self.n_edges
         NP_GT, NT_GT = self.n_gt_particles, self.n_gt_triangles
 
-        # Mesh-sized allocation (Phase B P1-2). Contact buffer heuristic scales
-        # with edges; overflow grows geometrically inside detect_contact.
-        # Clamp to max_blocks: the hint is only initial capacity, not a hard
-        # requirement (runtime overflow handling can grow up to the ceiling).
+        # Mesh-sized contact buffer: heuristic scales with edges; overflow
+        # grows geometrically inside detect_contact. Clamp to max_blocks —
+        # the hint is only initial capacity, not a hard requirement.
         bpe = int(getattr(c, "blocks_per_edge", 16))
         n_blocks_hint = max(
             int(getattr(c, "min_blocks", 1 << 16)),
@@ -618,8 +616,7 @@ class Stage3System:
         """Restore q_prev_newton if no candidate decreased a finite objective.
 
         Must run on the host after the (possibly graph-captured) line search.
-        AUDIT P0-5: without this, the final half-step remains even when it
-        increased energy.
+        Without this, the final half-step remains even when it increased energy.
         """
         e = float(self.energy.numpy()[0])
         e_prev = float(self.energy_prev.numpy()[0])

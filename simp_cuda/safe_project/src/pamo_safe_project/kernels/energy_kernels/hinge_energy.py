@@ -1,8 +1,7 @@
 """Hinge (dihedral) energy kernels and adjacency builders.
 
-Preprocess historically launched an O(F^2) face-pair kernel. The production path
-now builds opposite-edge hinges from a sorted half-edge table in O(F log F)
-(see ``build_hinge_indices``). The slow kernel remains for parity tests.
+Production path: ``build_hinge_indices`` (sorted half-edges, O(F log F)).
+``hinge_preprocess_slow_kernel`` is the O(F^2) face-pair builder kept for tests.
 """
 
 from __future__ import annotations

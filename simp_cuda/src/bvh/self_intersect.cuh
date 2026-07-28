@@ -14,10 +14,20 @@
 #include "tri_tri_3d.cuh"
 #include "tri_tri_2d.cuh"
 
-// Phase B #3: no per-face candidate correctness cap. Count/scan/fill is
-// two-pass and grows the packed buffer to the exclusive-scan total.
-// (Previous BUFFER_SIZE=512 hard-failed and weakened the SI guarantee.)
-// Soft resource limit: refuse pathological totals rather than OOM the machine.
+// Self-intersection pipeline (broad-phase then narrow-phase):
+//
+//   1. Build per-face geometry for LBVH (deleted faces -> tiny placeholders).
+//   2. Broad phase, two-pass packing so every AABB-overlap pair is listed:
+//        pass1: per face, count overlapping leaves (uncapped)
+//        exclusive_scan -> write offsets (first_query_result)
+//        grow intersect_candidates to total_slots
+//        pass2: re-walk BVH, write (query, partner) pairs at those offsets
+//      Each pair is 2 uints; total_slots = 2 * #candidate_pairs.
+//   3. Narrow phase: exact tri-tri test on each candidate; skip topological
+//      neighbors (shared edge / vertex-at-eps) so manifold adjacency is not SI.
+//   4. Record intersecting face indices for the collapse-undo consumer.
+//
+// Soft resource limit refuses pathological AABB density rather than OOM.
 #ifndef SELF_X_MAX_TOTAL_SLOTS
 #define SELF_X_MAX_TOTAL_SLOTS (1u << 28)  // ~1 GiB of uints max for candidates
 #endif
@@ -67,9 +77,10 @@ namespace selfx{
         return shared_vertices >= 2;
     }
 
-    // F is Triangle<int>{i,j,k}; face.i == -1 marks deleted. Query sees this as
+    // Pass 1: for each live face, count BVH leaves whose AABBs overlap this face.
+    // Output is slot counts (2 * #pairs) for exclusive_scan layout of pass 2.
+    // F is Triangle<int>{i,j,k}; face.i == -1 marks deleted. BVH query sees F as
     // int* with stride 3 so partner leaves with i==-1 are skipped.
-    // Uncapped count (max_candidates default = UINT_MAX).
     __global__ void compute_num_of_query_result_kernel(
         cusimp_free::Triangle<int>* F_d_raw,
         lbvh::bvh_device<float, selfx::Triangle<float3>> bvh_dev,
@@ -108,6 +119,9 @@ namespace selfx{
         num_found_query_raw[idx] = 2u * num_found;
     }
 
+    // Pass 2: re-walk BVH and pack (query_idx, partner_idx) at first_query_result[idx].
+    // max_pairs is the count-pass budget so a divergent second walk cannot
+    // write past the exclusive_scan layout.
     __global__ void compute_query_list_kernel(
         cusimp_free::Triangle<int>* F_d_raw,
         lbvh::bvh_device<float, selfx::Triangle<float3>> bvh_dev,
@@ -133,8 +147,6 @@ namespace selfx{
 
         const int *face_i_raw = reinterpret_cast<const int *>(F_d_raw);
         unsigned int first = first_query_result_raw[idx];
-        // Cap fill to the count-pass slot budget so a second traversal that
-        // finds more (should not happen) cannot scribble past exclusive_scan.
         unsigned int slots = num_found_query_raw[idx];
         unsigned int max_pairs = slots / 2u;
         // Count pass already hard-fails on stack overflow; ignore return here.
@@ -145,16 +157,16 @@ namespace selfx{
 
     void ensure_bvh_storage_size(cusimp_free::CUSimp_Free *sp)
     {
-        // resize (not just reserve): self_intersect writes [0, num_faces) and
-        // exclusive_scan reads/writes a +1 past-the-end total slot.
-        // Phase B #3: do NOT pre-size candidates to F * 512 * 2. Capacity is
-        // grown after the count pass from exclusive_scan totals.
+        // resize (not reserve): kernels write [0, num_faces); exclusive_scan
+        // needs a +1 past-the-end slot for the total. Candidate buffer is grown
+        // after the count pass from the scan total.
         sp->bvh_triangles.resize(sp->allocated_tris);
         sp->num_found_query.resize(sp->allocated_tris + 1);
         sp->first_query_result.resize(sp->allocated_tris + 1);
     }
 
-    // Phase B #4: grow-only SI scratch pool (no per-call cudaMalloc/Free).
+    // Grow-only SI result scratch on CUSimp_Free (no per-call malloc/free).
+    // capacity_ints is the max number of face-index slots we will store.
     void ensure_si_scratch(cusimp_free::CUSimp_Free *sp, unsigned int capacity_ints)
     {
         if (sp->si_is_intersect == nullptr) {
@@ -178,20 +190,20 @@ namespace selfx{
         }
     }
 
+    // Integer-center shift: subtract floor(mean) of the six triangle vertices so
+    // tri-tri predicates run near the origin and stay better conditioned.
     __device__
     inline int floor_mean(float v1, float v2, float v3, float v4, float v5, float v6) {
         float mean = (v1 + v2 + v3 + v4 + v5 + v6) / 6.0f;
         return (int)floorf(mean);
     }
 
-    // Function to translate points in all three axes
     __device__
     void translate_coordinates(float3 *p1, float3 *q1, float3 *r1, float3 *p2, float3 *q2, float3 *r2) {
         int mean_x = floor_mean(p1->x, q1->x, r1->x, p2->x, q2->x, r2->x);
         int mean_y = floor_mean(p1->y, q1->y, r1->y, p2->y, q2->y, r2->y);
         int mean_z = floor_mean(p1->z, q1->z, r1->z, p2->z, q2->z, r2->z);
 
-        // Translate all points by subtracting the floored mean values
         p1->x -= mean_x; p1->y -= mean_y; p1->z -= mean_z;
         q1->x -= mean_x; q1->y -= mean_y; q1->z -= mean_z;
         r1->x -= mean_x; r1->y -= mean_y; r1->z -= mean_z;
@@ -200,6 +212,9 @@ namespace selfx{
         r2->x -= mean_x; r2->y -= mean_y; r2->z -= mean_z;
     }
 
+    // Returns true if any non-adjacent face pair properly intersects.
+    // Side effect: fills sp->intersected_triangle_idx / n_intersect with the
+    // face indices that participate in intersections (for collapse undo).
     bool self_intersect(cusimp_free::CUSimp_Free *sp, unsigned int num_vertices, unsigned int num_faces, float epsilon) {
         if (num_faces == 0)
             return false;
@@ -210,10 +225,9 @@ namespace selfx{
 
         // get triangle data to build bvh -----------------
         // Removed faces are marked with i == -1 (see remove_invalid_faces).
-        // Indexing V_d_raw[-1] is a 12-byte OOB before the points allocation
-        // (HANDOFF2 §3.1; confirmed by compute-sanitizer memcheck).
-        // Placeholders use a tiny non-zero triangle so they don't all share the
-        // exact origin AABB; query kernels also skip i==-1 as query and partner.
+        // Must not index V_d_raw[-1] (OOB). Placeholders use a tiny non-zero
+        // triangle so they don't all share the origin AABB; query kernels also
+        // skip i==-1 as query and partner.
         thrust::for_each(thrust::device,
                          thrust::make_counting_iterator<std::size_t>(0),
                          thrust::make_counting_iterator<std::size_t>(num_faces),
@@ -313,15 +327,16 @@ namespace selfx{
             SELF_X_CHECK(cudaDeviceSynchronize());
         }
 
-        // Actual tri-tri intersection test based on intersection candidates ----
-        // Phase B #4: reuse pooled SI scratch (no per-call malloc/free).
+        // Narrow phase: exact tri-tri on each broad-phase candidate pair.
+        // Result buffer holds face indices (2 per intersecting pair); capacity
+        // is 2*F so each face can appear at most once as a stored index pair.
         const unsigned int capacity_ints = 2u * (unsigned int)num_faces;
         ensure_si_scratch(sp, capacity_ints);
 
         unsigned int* d_isIntersect = sp->si_is_intersect;
         unsigned int* d_intersections = sp->si_intersections;
-        unsigned int* d_total = sp->si_total;
-        unsigned int* d_stored = sp->si_stored;
+        unsigned int* d_total = sp->si_total;   // attempted writes (for overflow detect)
+        unsigned int* d_stored = sp->si_stored; // successful writes into d_intersections
 
         unsigned int h_isIntersect = 0;
         SELF_X_CHECK(cudaMemcpy(d_isIntersect, &h_isIntersect, sizeof(unsigned int), cudaMemcpyHostToDevice));
@@ -332,7 +347,6 @@ namespace selfx{
                                     (size_t)capacity_ints * sizeof(unsigned int)));
         }
 
-        // actual number of candidate pairs (each pair is 2 slots)
         unsigned int num_query_result = total_slots / 2u;
 
         if (num_query_result > 0) {
@@ -348,17 +362,15 @@ namespace selfx{
                                 if(F_d_raw[query_idx].i == -1) return;
                                 if(F_d_raw[current_idx].i == -1) return;
 
-                                // Retrieve faces for idx and query_idx
                                 cusimp_free::Triangle<int> current_face = F_d_raw[current_idx];
                                 cusimp_free::Triangle<int> query_face = F_d_raw[query_idx];
 
                                 Triangle<float3> current_tris = triangles_d_raw[current_idx];
                                 Triangle<float3> query_tris = triangles_d_raw[query_idx];
 
-
                                 int vertices_current[] = {current_face.i, current_face.j, current_face.k};
                                 int vertices_query[] = {query_face.i, query_face.j, query_face.k};
-                                int num_count = 0;
+                                int num_count = 0; // shared vertex *indices* (topology)
 
                                 float3 p1,q1,r1,p2,q2,r2;
                                 p1 = current_tris.v0;
@@ -370,10 +382,8 @@ namespace selfx{
 
                                 translate_coordinates(&p1, &q1, &r1, &p2, &q2, &r2);
 
-                                // compute number of shared vertex
                                 for(unsigned int j = 0; j < 3; j++){
                                     int vertex_current = vertices_current[j];
-
                                     for(unsigned int k = 0; k < 3; k++){
                                         if(vertex_current == vertices_query[k]){
                                             num_count++;
@@ -389,30 +399,27 @@ namespace selfx{
                                 copy_v3_v3_float_float3(tri_b[1], q2);
                                 copy_v3_v3_float_float3(tri_b[2], r2);
 
-                                // check if coplanar
+                                // Filters (not true self-intersections for our mesh):
+                                //  - coplanar: no implemented coplanar test; skip
+                                //  - num_count==2 or coord-shared edge: manifold neighbors
+                                //  - shared vertex + tiny intersection segment: contact at vertex
                                 if(is_coplanar(tri_a, tri_b)){
-                                    // Coplanar tests were previously dead code
-                                    // (unconditional return). Keep non-coplanar
-                                    // path as the active guarantee for now.
                                     return;
                                 }
 
-                                // no coplanar, shared edge
                                 if(num_count == 2){
-                                    return; // remove from the test
+                                    return;
                                 }
-                                else if(detect_shared_edge_coord(p1,q1,r1,p2,q2,r2)){ // remove from the test
+                                else if(detect_shared_edge_coord(p1,q1,r1,p2,q2,r2)){
                                     return;
                                 }
 
                                 float3 source, target;
-
                                 source = make_float3(1,1,1);
                                 target = make_float3(-1,-1,-1);
 
                                 float r_i1[3];
                                 float r_i2[3];
-                                // actual intersection test
                                 bool isIntersecting = isect_tri_tri_v3(p1,q1,r1,p2,q2,r2,r_i1,r_i2);
 
                                 if(isIntersecting){
@@ -420,14 +427,12 @@ namespace selfx{
                                     copy_v3_v3_float3_float(target, r_i2);
                                     float dist = largest_distance(source, target);
                                     bool sharedVertex = (num_count == 1);
-                                    // if the distance is less than eps with shared vertex, the intersection point would be shared vertex
                                     if(dist < epsilon && sharedVertex){
-                                        return; // not self intersect
+                                        return;
                                     }
                                     atomicExch(d_isIntersect, 1u);
+                                    // Always count into d_total; only write if capacity remains.
                                     unsigned int pos = atomicAdd(d_total, 2u);
-                                    // Write only if both slots fit; still count
-                                    // total so host can detect overflow.
                                     if (d_intersections != nullptr && pos + 1u < capacity_ints) {
                                         d_intersections[pos] = query_idx;
                                         d_intersections[pos + 1u] = current_idx;
@@ -443,8 +448,7 @@ namespace selfx{
         SELF_X_CHECK(cudaMemcpy(&h_total, d_total, sizeof(unsigned int), cudaMemcpyDeviceToHost));
         SELF_X_CHECK(cudaMemcpy(&h_stored, d_stored, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
-        // Copy only the stored ints into the persistent buffer; n_intersect is
-        // the stored count so get_undo_candidate never walks past capacity.
+        // Persist only what fit; n_intersect = stored count so undo never OOB.
         if (capacity_ints > 0 && h_stored > 0 && sp->intersected_triangle_idx != nullptr
             && d_intersections != nullptr) {
             unsigned int copy_n = h_stored < capacity_ints ? h_stored : capacity_ints;

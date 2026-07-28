@@ -252,7 +252,7 @@ namespace cusimp_free
     unsigned int *__restrict__ intersected_triangle_idx{};
     int * n_intersect{};
 
-    // Phase B #4: pooled SI scratch (reused across self_intersect calls)
+    // Pooled self-intersect scratch (reused across calls; grown as needed)
     unsigned int *si_is_intersect{};
     unsigned int *si_total{};
     unsigned int *si_stored{};

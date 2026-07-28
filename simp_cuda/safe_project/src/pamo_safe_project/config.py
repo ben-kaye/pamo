@@ -14,16 +14,16 @@ class Stage3Config:
         self.max_gt_particles = 1 << 24
         self.max_gt_samples = 1 << 14
 
-        # Phase B P1-2: size buffers from the registered mesh and grow on overflow.
-        # When True (default), Stage3System does not eagerly reserve ~5 GiB at init.
-        # When False, allocate the full max_* ceilings up front (legacy behaviour).
+        # Size buffers from the registered mesh and grow on overflow.
+        # When True (default), Stage3System does not eagerly reserve max_* memory.
+        # When False, allocate the full max_* ceilings up front.
         self.auto_capacity = True
         self.capacity_growth = 2.0  # geometric growth factor on overflow
         self.min_blocks = 1 << 16  # floor for contact-pair buffer
         self.blocks_per_edge = 16  # initial contact capacity heuristic vs n_edges
 
-        # Phase B #5: construct energy calculators on first use (not at system init).
-        # Set False to restore eager construction of every class in energy_calcs.
+        # Construct energy calculators on first use (not at system init).
+        # Set False to construct every class in energy_calcs eagerly.
         self.lazy_calculators = True
 
         # Solver parameters

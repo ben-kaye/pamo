@@ -1,4 +1,4 @@
-"""Phase B #2: O(F log F) hinge adjacency vs legacy O(F^2) kernel."""
+"""Hinge adjacency: sorted half-edge builder vs O(F^2) face-pair kernel."""
 
 from __future__ import annotations
 

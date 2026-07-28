@@ -211,7 +211,7 @@ namespace cusimp_free
         }
     }
 
-    // Phase B #4: grow-only collapse/undo scratch (no free+malloc each forward).
+    // Grow-only collapse/undo scratch (avoids free+malloc each forward).
     void CUSimp_Free::ensure_collapse_scratch(size_t edge_count)
     {
         if (n_collapsed == nullptr) {
@@ -1040,7 +1040,7 @@ namespace cusimp_free
         CHECK_CUDA(cudaMemcpy(tri_min_cost, temp.data(), n_tris * sizeof(uint64_cu), cudaMemcpyHostToDevice));
         propagate_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
-        // collapsed edge — Phase B #4: pool/grow, never free+malloc every iter.
+        // collapsed edge — pool/grow scratch, no free+malloc every iter
         ensure_collapse_scratch((size_t)std::max(n_edges, 0));
         CHECK_CUDA(cudaMemset(n_collapsed, 0, sizeof(int)));
         if (n_edges > 0 && collapsed_edge_idx != nullptr) {
