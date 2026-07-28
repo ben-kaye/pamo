@@ -16,8 +16,6 @@ from .kernels.energy_kernels.collision_energy import *
 from .kernels.energy_kernels.contact_detection import *
 from .kernels.geometry_kernels import *
 from .kernels.utils_kernels import *
-
-# from .kernels.utils_kernels import block_spd_project_kernel
 from .utils import wp_slice
 from .utils import stage3_logger as logger
 
