@@ -10,7 +10,8 @@
 #include "tri_tri_3d.cuh"
 #include "tri_tri_2d.cuh"
 
-// Average expected number of intersection candidates
+// Max AABB-overlap candidates per face. Each candidate packs as 2 uints
+// (query_idx, other_idx), so per-face worst-case write is 2 * BUFFER_SIZE.
 #define BUFFER_SIZE 512
 
 using namespace std;
@@ -47,83 +48,81 @@ namespace selfx{
         return shared_vertices >= 2;
     }
 
-    __global__ void compute_num_of_query_result_kernel(cusimp_free::CUSimp_Free *sp,
+    // F is Triangle<int>{i,j,k}; face.i == -1 marks deleted. Query sees this as
+    // int* with stride 3 so partner leaves with i==-1 are skipped (do not burn
+    // candidate slots on deleted faces clustered at the origin placeholder).
+    __global__ void compute_num_of_query_result_kernel(
         cusimp_free::Triangle<int>* F_d_raw,
         lbvh::bvh_device<float, selfx::Triangle<float3>> bvh_dev,
         unsigned int* num_found_query_raw,
         std::size_t num_faces)
     {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= num_faces) return;
-        // removed faces
+        if (idx >= (int)num_faces) return;
         if (F_d_raw[idx].i == -1) {
             num_found_query_raw[idx] = 0;
             return;
         }
-        unsigned int buffer[BUFFER_SIZE];
 
-        // Get query object
         const auto self = bvh_dev.objects[idx];
-
-        // Set query AABB
         lbvh::aabb<float> query_box;
         float minX = fminf(self.v0.x, fminf(self.v1.x, self.v2.x));
         float minY = fminf(self.v0.y, fminf(self.v1.y, self.v2.y));
         float minZ = fminf(self.v0.z, fminf(self.v1.z, self.v2.z));
-
         float maxX = fmaxf(self.v0.x, fmaxf(self.v1.x, self.v2.x));
         float maxY = fmaxf(self.v0.y, fmaxf(self.v1.y, self.v2.y));
         float maxZ = fmaxf(self.v0.z, fmaxf(self.v1.z, self.v2.z));
-
         query_box.lower = make_float4(minX, minY, minZ, 0);
         query_box.upper = make_float4(maxX, maxY, maxZ, 0);
 
-        // Perform the query
-        unsigned int num_found = lbvh::get_number_of_intersect_candidates(bvh_dev, lbvh::overlaps(query_box), buffer, idx);
-
-        // Copy results to the device vector
-        num_found_query_raw[idx] = 2 * num_found;
+        const int *face_i_raw = reinterpret_cast<const int *>(F_d_raw);
+        unsigned int num_found = lbvh::get_number_of_intersect_candidates(
+            bvh_dev, lbvh::overlaps(query_box), (unsigned int)idx,
+            face_i_raw, /*stride=*/3u, (unsigned int)BUFFER_SIZE);
+        // Store slot count (2 uints per candidate pair) for exclusive_scan.
+        num_found_query_raw[idx] = 2u * num_found;
     }
 
-    __global__ void compute_query_list_kernel(cusimp_free::CUSimp_Free *sp,
+    __global__ void compute_query_list_kernel(
         cusimp_free::Triangle<int>* F_d_raw,
         lbvh::bvh_device<float, selfx::Triangle<float3>> bvh_dev,
-        unsigned int* num_found_query_raw,
         unsigned int* first_query_result_raw,
         unsigned int* intersect_candidates_raw,
         std::size_t num_faces)
     {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= num_faces) return;
-        //removed faces
+        if (idx >= (int)num_faces) return;
         if (F_d_raw[idx].i == -1) return;
-        // Get query object
-        const auto self = bvh_dev.objects[idx];
 
-        // Set query AABB
+        const auto self = bvh_dev.objects[idx];
         lbvh::aabb<float> query_box;
         float minX = fminf(self.v0.x, fminf(self.v1.x, self.v2.x));
         float minY = fminf(self.v0.y, fminf(self.v1.y, self.v2.y));
         float minZ = fminf(self.v0.z, fminf(self.v1.z, self.v2.z));
-
         float maxX = fmaxf(self.v0.x, fmaxf(self.v1.x, self.v2.x));
         float maxY = fmaxf(self.v0.y, fmaxf(self.v1.y, self.v2.y));
         float maxZ = fmaxf(self.v0.z, fmaxf(self.v1.z, self.v2.z));
-
         query_box.lower = make_float4(minX, minY, minZ, 0);
         query_box.upper = make_float4(maxX, maxY, maxZ, 0);
 
-        // Perform the query
-        int first = first_query_result_raw[idx];
-        unsigned int num_found = lbvh::query_device(bvh_dev, lbvh::overlaps(query_box), intersect_candidates_raw, idx, first);
+        const int *face_i_raw = reinterpret_cast<const int *>(F_d_raw);
+        unsigned int first = first_query_result_raw[idx];
+        lbvh::query_device(bvh_dev, lbvh::overlaps(query_box),
+                          intersect_candidates_raw, (unsigned int)idx, first,
+                          face_i_raw, /*stride=*/3u, (unsigned int)BUFFER_SIZE);
     }
 
     void ensure_bvh_storage_size(cusimp_free::CUSimp_Free *sp)
     {
-        sp->bvh_triangles.reserve(sp->allocated_tris);
-        sp->num_found_query.reserve(sp->allocated_tris);
-        sp->first_query_result.reserve(sp->allocated_tris);
-        sp->intersect_candidates.reserve(sp->allocated_tris * BUFFER_SIZE);
+        // resize (not just reserve): self_intersect writes [0, num_faces) and
+        // exclusive_scan reads/writes a +1 past-the-end total slot.
+        // Candidate packing: 2 uints per pair, up to BUFFER_SIZE pairs/face
+        // => worst-case total = allocated_tris * BUFFER_SIZE * 2.
+        sp->bvh_triangles.resize(sp->allocated_tris);
+        sp->num_found_query.resize(sp->allocated_tris + 1);
+        sp->first_query_result.resize(sp->allocated_tris + 1);
+        sp->intersect_candidates.resize(
+            (size_t)sp->allocated_tris * (size_t)BUFFER_SIZE * 2u);
     }
 
     __device__
@@ -149,6 +148,9 @@ namespace selfx{
     }
 
     bool self_intersect(cusimp_free::CUSimp_Free *sp, unsigned int num_vertices, unsigned int num_faces, float epsilon) {
+        if (num_faces == 0)
+            return false;
+
         cusimp_free::Vertex<float>* V_d_raw = sp->points;
         cusimp_free::Triangle<int>* F_d_raw = sp->triangles;
         int* pts_occ_raw = sp->pts_occ;
@@ -156,6 +158,11 @@ namespace selfx{
         Triangle<float3>* triangles_d_raw = thrust::raw_pointer_cast(sp->bvh_triangles.data());
 
         // get triangle data to build bvh -----------------
+        // Removed faces are marked with i == -1 (see remove_invalid_faces).
+        // Indexing V_d_raw[-1] is a 12-byte OOB before the points allocation
+        // (HANDOFF2 §3.1; confirmed by compute-sanitizer memcheck).
+        // Placeholders use a tiny non-zero triangle so they don't all share the
+        // exact origin AABB; query kernels also skip i==-1 as query and partner.
         thrust::for_each(thrust::device,
                          thrust::make_counting_iterator<std::size_t>(0),
                          thrust::make_counting_iterator<std::size_t>(num_faces),
@@ -164,12 +171,20 @@ namespace selfx{
                             int v0_row = F_d_raw[idx].i;
                             int v1_row = F_d_raw[idx].j;
                             int v2_row = F_d_raw[idx].k;
+                            if (v0_row < 0 || v1_row < 0 || v2_row < 0) {
+                                // Degenerate placeholder; query kernels skip i==-1 faces.
+                                // Jitter by idx so deleted leaves don't all share one AABB.
+                                float s = 1e-20f * (float)(idx + 1);
+                                tri.v0 = make_float3(s, 0.f, 0.f);
+                                tri.v1 = make_float3(0.f, s, 0.f);
+                                tri.v2 = make_float3(0.f, 0.f, s);
+                                triangles_d_raw[idx] = tri;
+                                return;
+                            }
                             tri.v0 = make_float3(V_d_raw[v0_row].x, V_d_raw[v0_row].y, V_d_raw[v0_row].z);
                             tri.v1 = make_float3(V_d_raw[v1_row].x, V_d_raw[v1_row].y, V_d_raw[v1_row].z);
                             tri.v2 = make_float3(V_d_raw[v2_row].x, V_d_raw[v2_row].y, V_d_raw[v2_row].z);
                             triangles_d_raw[idx] = tri;
-
-                            return;
                          });
 
         // construct bvh -------------------------------
@@ -180,51 +195,61 @@ namespace selfx{
 
         // run query ----------------------------
         thrust::fill(thrust::device, sp->num_found_query.begin(), sp->num_found_query.end(), 0);
-        cudaDeviceSynchronize();
-        // init array of intersection candidates, 0xFFFFFFFF is invalid
-        thrust::fill(thrust::device, sp->intersect_candidates.begin(), sp->intersect_candidates.end(), 0xFFFFFFFF);
-        cudaDeviceSynchronize();
 
         // get raw pointer
         unsigned int* num_found_results_raw = thrust::raw_pointer_cast(sp->num_found_query.data());
-        unsigned int* intersect_candidates_raw = thrust::raw_pointer_cast(sp->intersect_candidates.data());
         unsigned int* first_query_result_raw = thrust::raw_pointer_cast(sp->first_query_result.data());
-        
-        // get number of collapsed edge
-        int n_collapsed_h = 0;
-        cudaMemcpy(&n_collapsed_h, sp->n_collapsed, sizeof(int), cudaMemcpyDeviceToHost);
 
-        // get number of intersection candidates
-        compute_num_of_query_result_kernel<<<(num_faces + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(sp, F_d_raw, bvh_dev, num_found_results_raw, num_faces);
+        const int n_blocks = (int)((num_faces + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        // get number of intersection candidates (slot counts per face)
+        compute_num_of_query_result_kernel<<<n_blocks, BLOCK_SIZE>>>(
+            F_d_raw, bvh_dev, num_found_results_raw, num_faces);
         cudaDeviceSynchronize();
-        thrust::exclusive_scan(thrust::device, num_found_results_raw, num_found_results_raw + num_faces + 1, sp->first_query_result.data());
+        thrust::exclusive_scan(thrust::device, num_found_results_raw,
+                               num_found_results_raw + num_faces + 1,
+                               sp->first_query_result.data());
+
+        // total packed slots (= 2 * total candidate pairs)
+        unsigned int total_slots = 0;
+        cudaMemcpy(&total_slots, first_query_result_raw + num_faces,
+                   sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+        // Grow candidate buffer if exclusive_scan total exceeds capacity
+        // (should not with per-face cap, but keep safe for future cap changes).
+        if ((size_t)total_slots > sp->intersect_candidates.size()) {
+            sp->intersect_candidates.resize((size_t)total_slots + (size_t)total_slots / 5u + 1u);
+        }
+        thrust::fill(thrust::device, sp->intersect_candidates.begin(),
+                     sp->intersect_candidates.end(), 0xFFFFFFFFu);
+        unsigned int* intersect_candidates_raw =
+            thrust::raw_pointer_cast(sp->intersect_candidates.data());
+        first_query_result_raw = thrust::raw_pointer_cast(sp->first_query_result.data());
 
         // save data of intersection candidates
-        compute_query_list_kernel<<<(num_faces + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(sp, F_d_raw, bvh_dev, num_found_results_raw, first_query_result_raw, intersect_candidates_raw, num_faces);
+        compute_query_list_kernel<<<n_blocks, BLOCK_SIZE>>>(
+            F_d_raw, bvh_dev, first_query_result_raw, intersect_candidates_raw, num_faces);
         cudaDeviceSynchronize();
 
-        // Actual tri-tri intersection test based on intersection cadidates ---------------------------------------
+        // Actual tri-tri intersection test based on intersection candidates ----
         unsigned int h_isIntersect = 0;
         unsigned int* d_isIntersect;
         cudaMalloc((void**)&d_isIntersect, sizeof(unsigned int));
         cudaMemcpy(d_isIntersect, &h_isIntersect, sizeof(unsigned int), cudaMemcpyHostToDevice);
-        
+
         // list of actual intersection pairs
-        const int maxIntersections = num_faces;
+        const int maxIntersections = (int)num_faces;
         unsigned int* d_intersections;
-        cudaMalloc((void**)&d_intersections, 2 * maxIntersections * sizeof(unsigned int));
-        cudaMemset(d_intersections + 2 * maxIntersections - 2, 0, sizeof(unsigned int));
+        cudaMalloc((void**)&d_intersections, 2ull * (size_t)maxIntersections * sizeof(unsigned int));
+        if (maxIntersections > 0) {
+            cudaMemset(d_intersections + 2 * maxIntersections - 2, 0, sizeof(unsigned int));
+        }
 
         unsigned int* d_pos;
         cudaMalloc(&d_pos, sizeof(unsigned int));
         cudaMemset(d_pos, 0, sizeof(unsigned int));
 
-        // get query result size
-        unsigned int num_query_result = 0;
-        cudaMemcpy(&num_query_result, &first_query_result_raw[num_faces], sizeof(unsigned int), cudaMemcpyDeviceToHost);
-        
-        // actual number of query result without the query idx
-        num_query_result /= 2;
+        // actual number of candidate pairs (each pair is 2 slots)
+        unsigned int num_query_result = total_slots / 2u;
 
         thrust::for_each(thrust::device,
                          thrust::make_counting_iterator<unsigned int>(0),

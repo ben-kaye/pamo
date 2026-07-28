@@ -5,26 +5,32 @@
 
 namespace lbvh
 {
-    template <typename Real, typename Objects, bool IsConst, typename OutputIterator>
+    // face_i_raw[obj * face_i_stride] == -1 means deleted face (skip as partner).
+    // For packed Triangle<int> {i,j,k}, pass (int*)F and face_i_stride=3.
+    // max_candidates caps pairs counted/written per query.
+    template <typename Real, typename Objects, bool IsConst>
     __device__ unsigned int get_number_of_intersect_candidates(
         const detail::basic_device_bvh<Real, Objects, IsConst> &bvh,
-        const query_overlap<Real> q, OutputIterator outiter,
+        const query_overlap<Real> q,
         const unsigned int query_idx,
-        const unsigned int max_buffer_size = 0xFFFFFFFF) noexcept
+        const int *face_i_raw = nullptr,
+        const unsigned int face_i_stride = 1,
+        const unsigned int max_candidates = 0xFFFFFFFF) noexcept
     {
         using bvh_type = detail::basic_device_bvh<Real, Objects, IsConst>;
         using index_type = typename bvh_type::index_type;
-        using aabb_type = typename bvh_type::aabb_type;
-        using node_type = typename bvh_type::node_type;
 
         index_type stack[STACK_SIZE];
         index_type *stack_ptr = stack;
-        OutputIterator outiter_begin = outiter;
         *stack_ptr++ = 0; // root node is always 0
 
         unsigned int num_found = 0;
         do
         {
+            // Prevent local stack overflow on degenerate trees.
+            if (stack_ptr - stack >= STACK_SIZE - 2)
+                break;
+
             const index_type node = *--stack_ptr;
             const index_type L_idx = bvh.nodes[node].left_idx;
             const index_type R_idx = bvh.nodes[node].right_idx;
@@ -34,7 +40,9 @@ namespace lbvh
                 const auto obj_idx = bvh.nodes[L_idx].object_idx;
                 if (obj_idx != 0xFFFFFFFF)
                 {
-                    if(obj_idx != query_idx)
+                    const bool deleted = face_i_raw != nullptr &&
+                        face_i_raw[obj_idx * face_i_stride] == -1;
+                    if (obj_idx != query_idx && !deleted && num_found < max_candidates)
                     {
                         ++num_found;
                     }
@@ -49,7 +57,9 @@ namespace lbvh
                 const auto obj_idx = bvh.nodes[R_idx].object_idx;
                 if (obj_idx != 0xFFFFFFFF)
                 {
-                    if(obj_idx != query_idx)
+                    const bool deleted = face_i_raw != nullptr &&
+                        face_i_raw[obj_idx * face_i_stride] == -1;
+                    if (obj_idx != query_idx && !deleted && num_found < max_candidates)
                     {
                         ++num_found;
                     }
@@ -67,29 +77,33 @@ namespace lbvh
 
 
     // dfs code ----------------------
+    // Writes (query_idx, obj_idx) pairs into outiter starting at index `first`.
+    // Each pair occupies 2 slots. Stops at max_candidates pairs.
     template <typename Real, typename Objects, bool IsConst, typename OutputIterator>
     __device__ unsigned int query_device(
         const detail::basic_device_bvh<Real, Objects, IsConst> &bvh,
         const query_overlap<Real> q, OutputIterator outiter,
         const unsigned int query_idx,
-        const unsigned int first = 0xFFFFFFFF) noexcept
+        const unsigned int first = 0,
+        const int *face_i_raw = nullptr,
+        const unsigned int face_i_stride = 1,
+        const unsigned int max_candidates = 0xFFFFFFFF) noexcept
     {
         using bvh_type = detail::basic_device_bvh<Real, Objects, IsConst>;
         using index_type = typename bvh_type::index_type;
-        using aabb_type = typename bvh_type::aabb_type;
-        using node_type = typename bvh_type::node_type;
 
-        index_type stack[STACK_SIZE]; // is it okay?
+        index_type stack[STACK_SIZE];
         index_type *stack_ptr = stack;
-        OutputIterator outiter_begin = outiter;
         *stack_ptr++ = 0; // root node is always 0
         unsigned int num_found = 0;
-        int iter = 0;
 
         // dynamic buffer
         outiter += first;
         do
         {
+            if (stack_ptr - stack >= STACK_SIZE - 2)
+                break;
+
             const index_type node = *--stack_ptr;
             const index_type L_idx = bvh.nodes[node].left_idx;
             const index_type R_idx = bvh.nodes[node].right_idx;
@@ -99,7 +113,9 @@ namespace lbvh
                 const auto obj_idx = bvh.nodes[L_idx].object_idx;
                 if (obj_idx != 0xFFFFFFFF)
                 {
-                    if(obj_idx != query_idx)
+                    const bool deleted = face_i_raw != nullptr &&
+                        face_i_raw[obj_idx * face_i_stride] == -1;
+                    if (obj_idx != query_idx && !deleted && num_found < max_candidates)
                     {
                         *outiter++ = query_idx;
                         *outiter++ = obj_idx;
@@ -116,7 +132,9 @@ namespace lbvh
                 const auto obj_idx = bvh.nodes[R_idx].object_idx;
                 if (obj_idx != 0xFFFFFFFF)
                 {
-                    if(obj_idx != query_idx)
+                    const bool deleted = face_i_raw != nullptr &&
+                        face_i_raw[obj_idx * face_i_stride] == -1;
+                    if (obj_idx != query_idx && !deleted && num_found < max_candidates)
                     {
                         *outiter++ = query_idx;
                         *outiter++ = obj_idx;
