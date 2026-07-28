@@ -24,18 +24,20 @@ def get_extensions():
 
     define_macros = []
     extra_compile_args = {}
-    if (torch.cuda.is_available() and (CUDA_HOME is not None)) or os.getenv(
-        "FORCE_CUDA", "0"
-    ) == "1":
+    # Build the CUDA extension whenever a toolkit is present. Do not require a
+    # visible runtime GPU (GPU-less CI / remote compile nodes still need .cu).
+    force_cuda = os.getenv("FORCE_CUDA", "0") == "1"
+    force_no_cuda = os.getenv("FORCE_NO_CUDA", "0") == "1"
+    if not force_no_cuda and (force_cuda or CUDA_HOME is not None or torch.cuda.is_available()):
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]
         nvcc_flags = os.getenv("NVCC_FLAGS", "")
         if nvcc_flags == "":
-            nvcc_flags = ["-O3", "--extended-lambda", "--fmad=false"] # <-- 여기에 플래그 추가
+            nvcc_flags = ["-O3", "--extended-lambda", "--fmad=false"]
         else:
             nvcc_flags = nvcc_flags.split(" ")
-            nvcc_flags.append("--extended-lambda") # <-- 여기에도 플래그 추가
+            nvcc_flags.append("--extended-lambda")
             nvcc_flags.append("--fmad=false")
         if platform.system() == "Windows":
             nvcc_flags.append("-Xcompiler")

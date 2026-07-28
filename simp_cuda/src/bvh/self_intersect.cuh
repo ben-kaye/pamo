@@ -18,18 +18,20 @@
 //
 //   1. Build per-face geometry for LBVH (deleted faces -> tiny placeholders).
 //   2. Broad phase, two-pass packing so every AABB-overlap pair is listed:
-//        pass1: per face, count overlapping leaves (uncapped)
+//        first pass: per face, count overlapping leaves (uncapped)
 //        exclusive_scan -> write offsets (first_query_result)
 //        grow intersect_candidates to total_slots
-//        pass2: re-walk BVH, write (query, partner) pairs at those offsets
-//      Each pair is 2 uints; total_slots = 2 * #candidate_pairs.
-//   3. Narrow phase: exact tri-tri test on each candidate; skip topological
-//      neighbors (shared edge / vertex-at-eps) so manifold adjacency is not SI.
+//        second pass: re-walk BVH, write (query, partner) pairs at those offsets
+//      Each pair is two unsigned integers; total_slots = 2 * candidate pair count.
+//   3. Narrow phase: exact triangle-triangle test on each candidate; skip
+//      topological neighbors (shared edge / vertex-at-epsilon) so manifold
+//      adjacency is not treated as a self-intersection.
 //   4. Record intersecting face indices for the collapse-undo consumer.
 //
-// Soft resource limit refuses pathological AABB density rather than OOM.
+// Soft resource limit refuses pathological AABB density rather than running
+// out of memory.
 #ifndef SELF_X_MAX_TOTAL_SLOTS
-#define SELF_X_MAX_TOTAL_SLOTS (1u << 28)  // ~1 GiB of uints max for candidates
+#define SELF_X_MAX_TOTAL_SLOTS (1u << 28)  // ~1 GiB of unsigned ints for candidates
 #endif
 
 using namespace std;
@@ -110,12 +112,13 @@ namespace selfx{
             bvh_dev, lbvh::overlaps(query_box), (unsigned int)idx,
             face_i_raw, /*stride=*/3u);
         // LBVH_STACK_OVERFLOW and 2*count wrap both become this sentinel.
-        // Host must hard-fail before exclusive_scan (partial counts miss SI).
+        // Host must hard-fail before exclusive_scan (partial counts miss
+        // self-intersections).
         if (num_found == LBVH_STACK_OVERFLOW || num_found > 0x7FFFFFFFu) {
             num_found_query_raw[idx] = LBVH_STACK_OVERFLOW;
             return;
         }
-        // Store slot count (2 uints per candidate pair) for exclusive_scan.
+        // Store slot count (two unsigned ints per candidate pair) for exclusive_scan.
         num_found_query_raw[idx] = 2u * num_found;
     }
 
@@ -165,8 +168,9 @@ namespace selfx{
         sp->first_query_result.resize(sp->allocated_tris + 1);
     }
 
-    // Grow-only SI result scratch on CUSimp_Free (no per-call malloc/free).
-    // capacity_ints is the max number of face-index slots we will store.
+    // Grow-only self-intersect result scratch on CUSimp_Free
+    // (no per-call malloc/free). capacity_ints is the max number of face-index
+    // slots we will store.
     void ensure_si_scratch(cusimp_free::CUSimp_Free *sp, unsigned int capacity_ints)
     {
         if (sp->si_is_intersect == nullptr) {
@@ -191,7 +195,7 @@ namespace selfx{
     }
 
     // Integer-center shift: subtract floor(mean) of the six triangle vertices so
-    // tri-tri predicates run near the origin and stay better conditioned.
+    // triangle-triangle predicates run near the origin and stay better conditioned.
     __device__
     inline int floor_mean(float v1, float v2, float v3, float v4, float v5, float v6) {
         float mean = (v1 + v2 + v3 + v4 + v5 + v6) / 6.0f;
@@ -225,9 +229,9 @@ namespace selfx{
 
         // get triangle data to build bvh -----------------
         // Removed faces are marked with i == -1 (see remove_invalid_faces).
-        // Must not index V_d_raw[-1] (OOB). Placeholders use a tiny non-zero
-        // triangle so they don't all share the origin AABB; query kernels also
-        // skip i==-1 as query and partner.
+        // Must not index V_d_raw[-1] (out of bounds). Placeholders use a tiny
+        // non-zero triangle so they don't all share the origin AABB; query
+        // kernels also skip i==-1 as query and partner.
         thrust::for_each(thrust::device,
                          thrust::make_counting_iterator<std::size_t>(0),
                          thrust::make_counting_iterator<std::size_t>(num_faces),
@@ -327,15 +331,15 @@ namespace selfx{
             SELF_X_CHECK(cudaDeviceSynchronize());
         }
 
-        // Narrow phase: exact tri-tri on each broad-phase candidate pair.
-        // Result buffer holds face indices (2 per intersecting pair); capacity
+        // Narrow phase: exact triangle-triangle test on each broad-phase pair.
+        // Result buffer holds face indices (two per intersecting pair); capacity
         // is 2*F so each face can appear at most once as a stored index pair.
         const unsigned int capacity_ints = 2u * (unsigned int)num_faces;
         ensure_si_scratch(sp, capacity_ints);
 
         unsigned int* d_isIntersect = sp->si_is_intersect;
         unsigned int* d_intersections = sp->si_intersections;
-        unsigned int* d_total = sp->si_total;   // attempted writes (for overflow detect)
+        unsigned int* d_total = sp->si_total;   // attempted writes (overflow detect)
         unsigned int* d_stored = sp->si_stored; // successful writes into d_intersections
 
         unsigned int h_isIntersect = 0;
@@ -448,7 +452,8 @@ namespace selfx{
         SELF_X_CHECK(cudaMemcpy(&h_total, d_total, sizeof(unsigned int), cudaMemcpyDeviceToHost));
         SELF_X_CHECK(cudaMemcpy(&h_stored, d_stored, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
-        // Persist only what fit; n_intersect = stored count so undo never OOB.
+        // Persist only what fit; n_intersect = stored count so undo never
+        // walks out of bounds.
         if (capacity_ints > 0 && h_stored > 0 && sp->intersected_triangle_idx != nullptr
             && d_intersections != nullptr) {
             unsigned int copy_n = h_stored < capacity_ints ? h_stored : capacity_ints;

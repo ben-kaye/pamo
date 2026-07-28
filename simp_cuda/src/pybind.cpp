@@ -98,7 +98,7 @@ namespace cusimp_free
       cudaFree(pamo.query_triangle_list); pamo.query_triangle_list = nullptr;
       cudaFree(pamo.intersected_triangle_idx); pamo.intersected_triangle_idx = nullptr;
       cudaFree(pamo.n_intersect); pamo.n_intersect = nullptr;
-      // SI / collapse scratch pool
+      // Self-intersect / collapse scratch pool
       cudaFree(pamo.si_is_intersect); pamo.si_is_intersect = nullptr;
       cudaFree(pamo.si_total); pamo.si_total = nullptr;
       cudaFree(pamo.si_stored); pamo.si_stored = nullptr;
@@ -106,6 +106,7 @@ namespace cusimp_free
       pamo.allocated_si_intersections = 0;
       pamo.allocated_collapsed_edge_idx = 0;
       pamo.allocated_edges_undo = 0;
+      pamo.allocated_vertices_undo = 0;
     }
 
 public:

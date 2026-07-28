@@ -177,7 +177,8 @@ def hinge_energy_kernel(
     rest_elen = rest_elens[hid]
 
     theta = compute_hinge_angle(x0, x1, x2, x3)
-    delta_theta = theta - rest_angle
+    # Wrap to (-pi, pi] so the atan2 branch cut is not a 2pi energy jump.
+    delta_theta = wp.atan2(wp.sin(theta - rest_angle), wp.cos(theta - rest_angle))
     energy_upd = 0.5 * stiffness * delta_theta * delta_theta * rest_elen
 
     wp.atomic_add(energy, 0, energy_upd)
@@ -260,7 +261,8 @@ def hinge_diff_kernel(
     sin_theta = wp.dot(wp.cross(n, n_), e0) / e0_len
     theta = wp.atan2(sin_theta, cos_theta)  # range (-pi, pi)
 
-    delta_theta = theta - rest_angle
+    # Wrap to (-pi, pi] so the atan2 branch cut is not a 2pi energy jump.
+    delta_theta = wp.atan2(wp.sin(theta - rest_angle), wp.cos(theta - rest_angle))
     dE_dtheta = stiffness * delta_theta * rest_elen
     d2E_dtheta2 = stiffness * rest_elen
 

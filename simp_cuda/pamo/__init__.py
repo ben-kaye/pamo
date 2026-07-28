@@ -49,11 +49,17 @@ class PaMO(nn.Module):
                 return verts, faces, verts_occ, verts_map, verts_undo
 
         self.func = DSPFunction
-        # mesh2vol params
+        # mesh2vol params (band/margin recomputed when R changes for a run)
         self.R = 256
-        self.band = 3 / self.R  # 3
-        self.margin = self.band * 2 + 1  # 2
+        self.band = 3 / self.R
+        self.margin = self.band * 2 + 1
         self.target_faces = None
+
+    def _set_stage1_resolution(self, R):
+        """Keep band/margin consistent with Dual-MC grid resolution."""
+        self.R = int(R)
+        self.band = 3.0 / self.R
+        self.margin = self.band * 2.0 + 1.0
 
     def _ensure_stage1(self):
         """Lazily construct Dual Marching Cubes when stage 1 is enabled."""
@@ -92,12 +98,6 @@ class PaMO(nn.Module):
 
     
     def remesh(self, tris, tris_min, tris_max, tris_mean):
-        #print("preprocess start")
-        # tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(points, triangles, self.band, self.margin)
-        
-        # tris = torch.tensor(tris, dtype=torch.float32, device='cuda:0')
-        # torch.cuda.synchronize()
-        
         d = torchcumesh2sdf.get_sdf(tris, self.R, self.band)
         d = d - 0.9 / self.R
         
@@ -132,19 +132,26 @@ class PaMO(nn.Module):
         self.target_faces = max(int(ratio * len(triangles)), min_faces)
         print("Target faces : {}".format(self.target_faces))
 
+        # Choose stage-1 resolution and recompute band/margin *before* normalize.
+        if self.use_stage1:
+            if self.target_faces <= 50:
+                self._set_stage1_resolution(64)
+            elif self.target_faces <= 1000:
+                self._set_stage1_resolution(128)
+            else:
+                self._set_stage1_resolution(256)
+        else:
+            self._set_stage1_resolution(256)
+
         # scale the input mesh
-        tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(points, triangles, self.band, self.margin)
-        tris = torch.tensor(tris, dtype=torch.float32, device='cuda:0')
+        tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(
+            points, triangles, self.band, self.margin)
+        device = points.device if points.is_cuda else torch.device('cuda')
+        tris = torch.tensor(tris, dtype=torch.float32, device=device)
 
         # stage1 (Remeshing)
         if self.use_stage1:
             self._ensure_stage1()
-            # Default 256
-            if self.target_faces <= 1000:
-                self.R = 128
-            if self.target_faces <= 50:
-                self.R = 64
-
             start_stage1 = time.time()
             verts, faces = self.remesh(tris, tris_min, tris_max, tris_mean)
             end_stage1 = time.time()
@@ -153,48 +160,53 @@ class PaMO(nn.Module):
             verts = points - torch.from_numpy(tris_mean).to(points.device)
             faces = triangles
 
-        # stage2 (Simplification)
-        start_stage2 =time.time()
-        verts_undo = torch.empty(0, dtype=torch.int32, device='cuda')
-        n_verts_undo = 0
-        count = 0
-        is_stuck = 0
-        scale = max(max(verts[:,0].max()-verts[:,0].min(), verts[:,1].max()-verts[:,1].min()), verts[:,2].max()-verts[:,2].min())
-        init = True
-        for it in range(iter):
-            num_faces_prev = faces.shape[0]
-            # Simplify
-            verts, faces, verts_occ, verts_map, verts_undo = self.func.apply(verts, faces, verts_undo, n_verts_undo, scale, threshold, is_stuck, init)
-            init = False
-            n_verts_undo = verts_undo.shape[0]
-            
-            # set verts and faces after 1 step of simplification
-            verts = verts[verts_occ.view(-1).bool()]
-            faces = faces[faces[:, 0] >= 0]
-            faces[:,0] = verts_map[faces[:,0].long()].view(-1)
-            faces[:,1] = verts_map[faces[:,1].long()].view(-1)
-            faces[:,2] = verts_map[faces[:,2].long()].view(-1)
-            
-            num_faces_current = faces.shape[0]
-            
-            if num_faces_current <= self.target_faces or num_faces_current <= 10:
-                break # simplified to target ratio
-            
-            if num_faces_current == num_faces_prev:
-                count += 1
-            else:
-                count = 0
-                is_stuck = 0
+        # stage2 (Simplification) — skip if already at/under target
+        start_stage2 = time.time()
+        if faces.shape[0] > self.target_faces and faces.shape[0] > 10:
+            verts_undo = torch.empty(0, dtype=torch.int32, device=verts.device)
+            n_verts_undo = 0
+            count = 0
+            is_stuck = 0
+            scale = max(
+                max(verts[:, 0].max() - verts[:, 0].min(),
+                    verts[:, 1].max() - verts[:, 1].min()),
+                verts[:, 2].max() - verts[:, 2].min(),
+            )
+            init = True
+            for it in range(iter):
+                num_faces_prev = faces.shape[0]
+                verts, faces, verts_occ, verts_map, verts_undo = self.func.apply(
+                    verts, faces, verts_undo, n_verts_undo, scale, threshold,
+                    is_stuck, init)
+                init = False
+                n_verts_undo = verts_undo.shape[0]
 
-            if count >= 2:
-                is_stuck = 1
-                
-            if count == tolerance:
-                print("Not enough edges available to be collapsed.")
-                break
-        
+                verts = verts[verts_occ.view(-1).bool()]
+                faces = faces[faces[:, 0] >= 0]
+                faces[:, 0] = verts_map[faces[:, 0].long()].view(-1)
+                faces[:, 1] = verts_map[faces[:, 1].long()].view(-1)
+                faces[:, 2] = verts_map[faces[:, 2].long()].view(-1)
+
+                num_faces_current = faces.shape[0]
+
+                if num_faces_current <= self.target_faces or num_faces_current <= 10:
+                    break
+
+                if num_faces_current == num_faces_prev:
+                    count += 1
+                else:
+                    count = 0
+                    is_stuck = 0
+
+                if count >= 2:
+                    is_stuck = 1
+
+                if count == tolerance:
+                    print("Not enough edges available to be collapsed.")
+                    break
+
         end_stage2 = time.time()
-        verts = verts.cpu().numpy()+ tris_mean
+        verts = verts.cpu().numpy() + tris_mean
         faces = faces.cpu().numpy()
         print(f"Time for Simplification: {end_stage2 - start_stage2} sec")
         

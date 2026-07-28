@@ -71,13 +71,9 @@ namespace cusimp_free
             CHECK_CUDA(
                 cudaMalloc((void **)&original_points, (allocated_pts + 1) * sizeof(Vertex<float>)));
 
-            CHECK_CUDA(cudaFree(vertices_undo_list));
-            CHECK_CUDA(
-                cudaMalloc((void **)&vertices_undo_list, (allocated_pts + 1) * sizeof(int)));
-            
-            CHECK_CUDA(cudaFree(tmp_vertices_undo_list));
-            CHECK_CUDA(
-                cudaMalloc((void **)&tmp_vertices_undo_list, (allocated_pts + 1) * sizeof(int)));
+            // Undo lists grow via ensure_vertices_undo_storage (may exceed n_pts).
+            // Keep them at least as large as points so indices always fit.
+            ensure_vertices_undo_storage(allocated_pts);
 
             CHECK_CUDA(cudaFree(vertices_invalid_list));
             CHECK_CUDA(
@@ -86,7 +82,44 @@ namespace cusimp_free
             CHECK_CUDA(cudaFree(vertices_invalid_table));
             CHECK_CUDA(
                 cudaMalloc((void **)&vertices_invalid_table, (allocated_pts + 1) * sizeof(bool)));
+            // Fresh allocation is uninitialized; every edge reads this table.
+            CHECK_CUDA(cudaMemset(vertices_invalid_table, 0,
+                                  (allocated_pts + 1) * sizeof(bool)));
         }
+    }
+
+    void CUSimp_Free::ensure_vertices_undo_storage(size_t n)
+    {
+        // Grow-only undo buffers. Must NOT reallocate points/tris mid-forward.
+        if (n <= allocated_vertices_undo)
+            return;
+        size_t new_cap = size_t(n + n / 5);
+        if (new_cap < n + 1)
+            new_cap = n + 1;
+
+        int *new_list = nullptr;
+        int *new_tmp = nullptr;
+        CHECK_CUDA(cudaMalloc((void **)&new_list, (new_cap + 1) * sizeof(int)));
+        CHECK_CUDA(cudaMalloc((void **)&new_tmp, (new_cap + 1) * sizeof(int)));
+        CHECK_CUDA(cudaMemset(new_list, 0, (new_cap + 1) * sizeof(int)));
+        CHECK_CUDA(cudaMemset(new_tmp, 0, (new_cap + 1) * sizeof(int)));
+
+        if (allocated_vertices_undo > 0 && vertices_undo_list != nullptr) {
+            size_t copy_n = allocated_vertices_undo + 1;
+            CHECK_CUDA(cudaMemcpy(new_list, vertices_undo_list, copy_n * sizeof(int),
+                                  cudaMemcpyDeviceToDevice));
+        }
+        if (allocated_vertices_undo > 0 && tmp_vertices_undo_list != nullptr) {
+            size_t copy_n = allocated_vertices_undo + 1;
+            CHECK_CUDA(cudaMemcpy(new_tmp, tmp_vertices_undo_list, copy_n * sizeof(int),
+                                  cudaMemcpyDeviceToDevice));
+        }
+
+        CHECK_CUDA(cudaFree(vertices_undo_list));
+        CHECK_CUDA(cudaFree(tmp_vertices_undo_list));
+        vertices_undo_list = new_list;
+        tmp_vertices_undo_list = new_tmp;
+        allocated_vertices_undo = new_cap;
     }
 
     void CUSimp_Free::ensure_tris_storage_size(size_t tris_count)
@@ -211,7 +244,10 @@ namespace cusimp_free
         }
     }
 
-    // Grow-only collapse/undo scratch (avoids free+malloc each forward).
+    // Grow-only collapse/undo scratch retained across forward() calls.
+    // Freeing+reallocating every iteration was a VRAM leak / invalid-arg source.
+    // edge_count must cover collapse_edge_kernel + remove_line_edge_collapse
+    // (both atomicAdd into collapsed_edge_idx; worst case ~2 * n_edges).
     void CUSimp_Free::ensure_collapse_scratch(size_t edge_count)
     {
         if (n_collapsed == nullptr) {
@@ -256,6 +292,7 @@ namespace cusimp_free
         return i==j || j==k || k==i;
     }
 
+    // Mark degenerate faces (two equal vertex indices) as deleted (i=j=k=-1).
     __global__ void remove_invalid_faces(CUSimp_Free sp)
     {
         int tri_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -272,6 +309,8 @@ namespace cusimp_free
         return;
     }
 
+    // After collapse, zero edge endpoints that touch a deleted face (so costs /
+    // later topology walks ignore them).
     __global__ void remove_line_edge_collapse(CUSimp_Free sp){
         int edge_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (edge_index >= sp.n_edges)
@@ -314,6 +353,9 @@ namespace cusimp_free
         }
     }
 
+    // Build vertex -> incident-face compressed sparse row layout:
+    //   count per vertex, exclusive_scan -> first_near_tris, then scatter
+    //   face ids into near_tris[first_near_tris[v] .. first_near_tris[v+1]).
     __global__ void count_near_tris_kernel(CUSimp_Free sp)
     {
         int tri_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -344,6 +386,9 @@ namespace cusimp_free
         sp.near_tris[sp.first_near_tris[tri.k] + atomicAdd(&sp.near_offset[tri.k], 1)] = tri_index;
     }
 
+    // Edge list: each undirected edge is emitted once by the face that owns the
+    // half-edge where the higher vertex index comes first (i>j, j>k, or k>i).
+    // count -> exclusive_scan(first_edge) -> create_edge fills edges[].
     __global__ void count_edge_kernel(CUSimp_Free sp)
     {
         int tri_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -375,6 +420,8 @@ namespace cusimp_free
             sp.edges[first++] = {int(tri.i), int(tri.k)};
     }
 
+    // Plane equation ax+by+cz+d=0 for the quadric error metric
+    // (unit normal, d = -n·v0).
     __device__ Vec4<float> tri2plane(Vertex<float> const *points, Triangle<int> tri)
     {
         Vertex<float> v0 = points[tri.i];
@@ -386,12 +433,12 @@ namespace cusimp_free
         return {normal.x, normal.y, normal.z, offset};
     }
 
+    // Per-vertex quadric error matrix: sum of p p^T over planes of incident faces.
     __global__ void compute_vert_Q_kernel(CUSimp_Free sp)
     {
         int pt_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (pt_index >= sp.n_pts)
             return;
-        // printf("pt_index %d sp.n_pts %d\n", pt_index, sp.n_pts);
 
         int first = sp.first_near_tris[pt_index];
         int last = sp.first_near_tris[pt_index + 1];
@@ -401,7 +448,6 @@ namespace cusimp_free
             Vec4<float> p = tri2plane(sp.points, sp.triangles[sp.near_tris[i]]);
             Mat4x4<float> temp = p.dot_T(p);
             Kp += p.dot_T(p);
-            // printf("p %f %f %f %f\ntemp %f %f %f %f\n %f %f %f %f\n %f %f %f %f\n %f %f %f %f\n\n", p.x, p.y, p.z, p.w, temp.m00, temp.m01, temp.m02, temp.m03, temp.m10, temp.m11, temp.m12, temp.m13, temp.m20, temp.m21, temp.m22, temp.m23, temp.m30, temp.m31, temp.m32, temp.m33);
         }
         sp.vert_Q[pt_index] = Kp;
     }
@@ -420,6 +466,15 @@ namespace cusimp_free
         return (p0 - p1).norm();
     }
 
+    // Edge collapse cost (32-bit unsigned, higher = worse). Leaves COST_INVALID
+    // if the collapse is topologically invalid or any intermediate term is NaN.
+    //
+    // Validity: the two endpoints must share exactly two common "next" neighbors
+    // (dup_num==2) — the usual manifold link condition for a collapsible edge.
+    //
+    // Cost ≈ quadric error at midpoint + length terms + skinny-triangle penalty.
+    // Also rejects collapses that would flip a neighboring face normal.
+    // Quantized into [0, COST_RANGE] then mapped to 32-bit unsigned for atomicMin.
     __global__ void compute_edge_cost_kernel(CUSimp_Free sp, bool is_stuck)
     {
         int edge_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -427,7 +482,6 @@ namespace cusimp_free
             return;
 
         // Reject by default; only overwrite after every validity check passes.
-        // (Stale/uninitialized costs were a nondeterminism and crash source.)
         const uint32_t COST_INVALID = std::numeric_limits<uint32_t>::max();
         sp.edge_cost[edge_index] = COST_INVALID;
 
@@ -441,11 +495,10 @@ namespace cusimp_free
             return;
 
         // is_stuck only affects which vertices are marked invalid (host path).
-        // Always recompute costs: edge indices are rebuilt each forward call, so
-        // reusing prior array slots would apply costs to the wrong edges.
+        // Always recompute: edges are rebuilt each forward(), so old slots are wrong.
         (void)is_stuck;
 
-        // check if the collapse is valid
+        // Manifold link check (exactly two shared opposite vertices).
         int dup_num = 0;
         for (int i = sp.first_near_tris[edge.u]; i < sp.first_near_tris[edge.u + 1]; ++i)
         {
@@ -607,13 +660,14 @@ namespace cusimp_free
             num_tri++;
         }
         
-        // weight
+        // Skinny-face penalty (larger Q_a => higher cost).
         const float SKINNY_TRIANGLE_PENALTY = 5.0f;
         Q_a = SKINNY_TRIANGLE_PENALTY * Q_a;
 
         if (num_tri <= 0)
             return;
 
+        // Classic Garland–Heckbert: cost = v^T (Q_u + Q_v) v at the midpoint.
         Mat4x4<float> Q = sp.vert_Q[edge.u] + sp.vert_Q[edge.v];
         Vec4<float> v4 = {v.x, v.y, v.z, 1};
         float cost = Q.vTMv(v4) / (sp.edge_s * sp.edge_s);
@@ -623,6 +677,11 @@ namespace cusimp_free
         sp.edge_cost[edge_index] = uint32_t(clamp(total, 0.0f, COST_RANGE) / COST_RANGE * std::numeric_limits<uint32_t>::max());
     }
 
+    // For each face, remember the cheapest incident edge as packed
+    //   (cost_u32 << 32) | edge_index
+    // so atomicMin picks lower cost, and on ties the smaller edge index.
+    // collapse_edge_kernel then only fires when *every* face in the one-ring
+    // of both endpoints agrees that this edge is their min — i.e. independent set.
     __global__ void propagate_edge_cost_kernel(CUSimp_Free sp)
     {
         uint32_t edge_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -631,7 +690,6 @@ namespace cusimp_free
 
         Edge<int> edge = sp.edges[edge_index];
         uint64_cu cost = (((uint64_cu)sp.edge_cost[edge_index]) << 32) | edge_index;
-        // printf("cost %llu edge_index %d, ((uint64_cu)edge_index) << 32 %llu, sp.edge_cost[edge_index] %u \n", cost, edge_index, ((uint64_cu)edge_index) << 32, sp.edge_cost[edge_index]);
 
         int first = sp.first_near_tris[edge.u];
         int last = sp.first_near_tris[edge.u + 1];
@@ -675,17 +733,21 @@ namespace cusimp_free
         return (area < threshold_area);
     }
 
+    // Parallel independent-set collapse:
+    //   1. cost <= collapse_t (threshold quantized to 32-bit unsigned)
+    //   2. for every face in the one-ring of u and of v,
+    //      tri_min_cost[face] equals this edge
+    // Then: midpoint at u, delete v, delete faces that used both endpoints,
+    // reindex faces that used only v to u. If any resulting face is skinny,
+    // restore original_points / original_tris for the local star (in-kernel undo).
     __global__ void collapse_edge_kernel(CUSimp_Free sp)
     {
         int edge_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (edge_index >= sp.n_edges)
             return;
-        // printf("edge_index %d\n", edge_index);
-        // atomicAdd(&sp.debug[0], 1);
 
         Edge<int> edge = sp.edges[edge_index];
         uint64_cu cost = (((uint64_cu)sp.edge_cost[edge_index]) << 32) | edge_index;
-        // printf("sp.edge_cost[edge_index] %u, sp.collapse_t %u\n", sp.edge_cost[edge_index], sp.collapse_t);
         if (sp.edge_cost[edge_index] > sp.collapse_t)
         {
             // printf("enter\n");
@@ -719,7 +781,7 @@ namespace cusimp_free
             }
         }
 
-        // collapsing start
+        // Independent set member: perform collapse u <- midpoint, drop v.
         int pos = atomicAdd(sp.n_collapsed, 1);
         sp.collapsed_edge_idx[pos] = edge_index;
 
@@ -755,7 +817,7 @@ namespace cusimp_free
 
 
 
-        // detect skinny and undo
+        // Local quality gate: restore pre-collapse star if a face went degenerate.
         bool is_skinny = false;
         first = sp.first_near_tris[edge.u];
         last = sp.first_near_tris[edge.u + 1];
@@ -812,6 +874,9 @@ namespace cusimp_free
         }
     }
 
+    // If any face in the star of a collapsed edge appears in the
+    // self-intersection face list, queue that edge for undo (edges_undo) and
+    // record its endpoints for invalid-vertex / stuck-path bookkeeping.
     __global__ void get_undo_candidate_kernel(CUSimp_Free sp)
     {
         int collapsed_edge_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -820,8 +885,7 @@ namespace cusimp_free
 
         int collapsed_edge_idx = sp.collapsed_edge_idx[collapsed_edge_index];
         Edge<int> edge = sp.edges[collapsed_edge_idx];
-        // n_intersect is a stored count of triangle indices (not pairs).
-        // Capacity is 2 * (allocated_tris + 1); never read past it.
+        // n_intersect = number of face indices stored (flat list, not pairs).
         int num_intersect = *sp.n_intersect;
         if (num_intersect < 0)
             num_intersect = 0;
@@ -869,17 +933,16 @@ namespace cusimp_free
         }
     }
 
+    // Restore original_points / original_tris for the one-ring of an undo edge
+    // (inverse of collapse_edge_kernel's topology rewrite).
     __global__ void undo_collapse_kernel(CUSimp_Free sp)
     {
         int index = blockIdx.x * blockDim.x + threadIdx.x;
         if (index >= *sp.n_edges_undo)
             return;
-        // if(index >= *sp.n_collapsed) return;
 
         int collapsed_edge_idx = sp.edges_undo[index];
-        // int collapsed_edge_idx = sp.collapsed_edge_idx[index];
         Edge<int> edge = sp.edges[collapsed_edge_idx];
-        // printf("undo %d %d\n", edge.u, edge.v);
 
         sp.pts_occ[edge.v] = 1;
 
@@ -931,66 +994,105 @@ namespace cusimp_free
         sp.vertices_invalid_table[idx_invalid] = true;
     }
 
+    // One parallel quadric-error edge-collapse iteration (stage 2 core).
+    //
+    // Pipeline:
+    //   stuck/invalid vertex bookkeeping
+    //   copy input mesh; optional face shuffle (init)
+    //   snapshot original_* for undo
+    //   compressed sparse row near-triangles, undirected edges
+    //   Q matrices -> edge costs -> propagate face-min costs
+    //   independent-set collapse
+    //   if any collapse: remove degenerates, self-intersection test,
+    //     undo collapses that caused self-intersections (up to 5 rounds)
+    //   exclusive_sum(pts_occ) -> pts_map for compact vertex ids
+    //
+    // Scratch (self-intersect and collapse lists) is pooled on this object.
     __host__ void CUSimp_Free::forward(Vertex<float> *pts, Triangle<int> *tris, int *verts_undo, int n_verts_undo, int nPts, int nTris, float scale, float threshold, bool is_stuck, bool init)
     {
         float epsilon = 1e-3;
-        // processing input vertex map
         n_vertices_undo = 0;
         n_invalid_vertices = 0;
         int first_n_vertices_undo = 0;
-        // if is stuck, accumulate the invalid list
-        if(is_stuck){
-            cudaMemcpy(tmp_vertices_undo_list, verts_undo, n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice);
+
+        // Stuck path: keep accumulating undo vertices across host iterations.
+        // Uses pts_map from the previous forward (verts_undo is pre-compact space).
+        if (is_stuck && n_verts_undo > 0) {
+            ensure_vertices_undo_storage((size_t)n_verts_undo);
+            CHECK_CUDA(cudaMemcpy(tmp_vertices_undo_list, verts_undo,
+                                  n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice));
             n_vertices_undo += n_verts_undo;
-            rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
+            rearrange_index_of_undo_vertices<<<
+                (n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this,
+                                                                              first_n_vertices_undo);
+            CHECK_KERNEL();
             first_n_vertices_undo += n_verts_undo;
         }
-        else{
-            if(n_verts_undo != 0)
-                CHECK_CUDA(cudaMemset(vertices_invalid_table, 0, (allocated_pts + 1) * sizeof(bool)));
-        }
 
-        if (n_verts_undo != 0)
-        {
-            // not stuck, set vertics_invalid_table as all 0
-            cudaMemcpy(vertices_invalid_list, verts_undo, n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice);
-            n_invalid_vertices = n_verts_undo;
-            compute_invalid_vertices_table<<<(n_invalid_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-        }
-
-        int first_n_edges_undo_init_val = first_n_vertices_undo;
-
-        // start simplifying
         tres = threshold;
         edge_s = scale;
+        // Quantize float threshold into the same 32-bit unsigned domain as edge_cost.
         collapse_t = uint32_t(clamp(threshold, float(0.0), COST_RANGE) / COST_RANGE * std::numeric_limits<uint32_t>::max());
-        // printf("collapse_t %u\n", collapse_t);
 
         resize(nPts, nTris);
 
         ensure_pts_storage_size(n_pts);
+        // pts/tris are device pointers from PyTorch CUDA tensors (see pybind).
         CHECK_CUDA(cudaMemcpy(points, pts, n_pts * sizeof(Vertex<float>),
-                              cudaMemcpyHostToDevice));
+                              cudaMemcpyDeviceToDevice));
         std::vector<int> tmp(n_pts, 1);
         CHECK_CUDA(cudaMemcpy(pts_occ, tmp.data(), n_pts * sizeof(int), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemset(pts_occ + n_pts, 0, sizeof(int)));
         ensure_tris_storage_size(n_tris);
         CHECK_CUDA(cudaMemcpy(triangles, tris, n_tris * sizeof(Triangle<int>),
-                              cudaMemcpyHostToDevice));
+                              cudaMemcpyDeviceToDevice));
+
+        // Invalid-vertex table: always clear AFTER ensure (realloc can replace it),
+        // then re-apply flags from verts_undo. Empty undo ⇒ fully clear.
+        CHECK_CUDA(cudaMemset(vertices_invalid_table, 0,
+                              (allocated_pts + 1) * sizeof(bool)));
+        if (n_verts_undo > 0) {
+            // invalid_list holds n_verts_undo entries; table is vertex-id sized (pts).
+            // Grow list via undo capacity without reallocating mesh buffers.
+            ensure_vertices_undo_storage((size_t)n_verts_undo);
+            if (vertices_invalid_list == nullptr || (size_t)n_verts_undo > allocated_pts) {
+                // Fall back: invalid_list historically matches pts capacity; if the
+                // undo list is longer, stage through tmp_vertices_undo_list.
+                CHECK_CUDA(cudaMemcpy(tmp_vertices_undo_list, verts_undo,
+                                      n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice));
+                n_invalid_vertices = n_verts_undo;
+                // Mark table from tmp (reuse list pointer for this kernel launch).
+                int *saved = vertices_invalid_list;
+                vertices_invalid_list = tmp_vertices_undo_list;
+                compute_invalid_vertices_table<<<
+                    (n_invalid_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+                CHECK_KERNEL();
+                vertices_invalid_list = saved;
+            } else {
+                CHECK_CUDA(cudaMemcpy(vertices_invalid_list, verts_undo,
+                                      n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice));
+                n_invalid_vertices = n_verts_undo;
+                compute_invalid_vertices_table<<<
+                    (n_invalid_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+                CHECK_KERNEL();
+            }
+        }
+
+        // Shuffle face order once so parallel independence is not mesh-order biased.
         if (init){
             thrust::device_ptr<Triangle<int>> thrust_triangles(triangles);
             thrust::default_random_engine rng;
             thrust::shuffle(thrust_triangles, thrust_triangles + n_tris, rng);
         }
         
-        // original data to do undo operation
+        // Snapshot for local skinny-undo and self-intersection undo.
         CHECK_CUDA(cudaMemcpy(original_points, points, n_pts * sizeof(Vertex<float>), cudaMemcpyDeviceToDevice));
         CHECK_CUDA(cudaMemcpy(original_tris, triangles, n_tris * sizeof(Triangle<int>),
                               cudaMemcpyDeviceToDevice));
 
         size_t temp_storage_bytes = 0;
 
-        // get number of near_tris
+        // --- adjacency: vertex -> faces (compressed sparse row) ---
         ensure_near_count_storage_size(n_pts);
         CHECK_CUDA(cudaMemset(first_near_tris, 0, (n_pts + 1) * sizeof(int)));
         count_near_tris_kernel<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
@@ -998,7 +1100,6 @@ namespace cusimp_free
         ensure_temp_storage_size(temp_storage_bytes);
         cub::DeviceScan::ExclusiveSum(temp_storage, allocated_temp_storage_size, first_near_tris, first_near_tris, n_pts + 1);
 
-        // get near_tris
         CHECK_CUDA(cudaMemcpy(&n_near_tris, first_near_tris + n_pts, sizeof(int),
                               cudaMemcpyDeviceToHost));
         ensure_near_tris_storage_size(n_near_tris);
@@ -1006,7 +1107,7 @@ namespace cusimp_free
         CHECK_CUDA(cudaMemset(near_offset, 0, (n_pts + 1) * sizeof(int)));
         create_near_tris_kernel<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
-        // get number of edge
+        // --- undirected edges (one per half-edge with higher-first endpoint) ---
         ensure_edge_count_storage_size(n_tris);
         CHECK_CUDA(cudaMemset(first_edge, 0, (n_tris + 1) * sizeof(int)));
         count_edge_kernel<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
@@ -1014,19 +1115,17 @@ namespace cusimp_free
         ensure_temp_storage_size(temp_storage_bytes);
         cub::DeviceScan::ExclusiveSum(temp_storage, allocated_temp_storage_size, first_edge, first_edge, n_tris + 1);
 
-        // get edge
         CHECK_CUDA(cudaMemcpy(&n_edges, first_edge + n_tris, sizeof(int),
                               cudaMemcpyDeviceToHost));
         ensure_edge_storage_size(n_edges);
         create_edge_kernel<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
-        // compute cost for each edges
+        // --- quadric error costs + face-min packing for independence ---
         ensure_vert_Q_storage_size(n_pts);
         compute_vert_Q_kernel<<<(n_pts + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
         ensure_edge_cost_storage_size(n_edges);
-        // Initialize all costs to invalid before the kernel (defensive against
-        // partial writes / future early-exit paths). Kernel also assigns first.
+        // 0xFF.. = COST_INVALID; kernel overwrites valid edges only.
         CHECK_CUDA(cudaMemset(edge_cost, 0xFF, (size_t)n_edges * sizeof(uint32_t)));
         if (n_edges > 0) {
             compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, is_stuck);
@@ -1034,48 +1133,63 @@ namespace cusimp_free
         }
         CHECK_CUDA(cudaMemcpy(original_edge_cost, edge_cost, n_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
 
-        // cost propagate
         ensure_tri_min_cost_storage_size(n_tris);
         std::vector<uint64_cu> temp(n_tris, std::numeric_limits<uint64_cu>::max());
         CHECK_CUDA(cudaMemcpy(tri_min_cost, temp.data(), n_tris * sizeof(uint64_cu), cudaMemcpyHostToDevice));
         propagate_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
-        // collapsed edge — pool/grow scratch, no free+malloc every iter
-        ensure_collapse_scratch((size_t)std::max(n_edges, 0));
+        // --- independent-set collapse ---
+        // collapse_edge_kernel and remove_line_edge_collapse both append via
+        // atomicAdd(n_collapsed); allocate 2 * n_edges slots.
+        const size_t collapse_slots = (size_t)std::max(n_edges, 0) * 2u;
+        ensure_collapse_scratch(collapse_slots);
         CHECK_CUDA(cudaMemset(n_collapsed, 0, sizeof(int)));
-        if (n_edges > 0 && collapsed_edge_idx != nullptr) {
-            CHECK_CUDA(cudaMemset(collapsed_edge_idx, 0, (size_t)n_edges * sizeof(int)));
+        if (collapse_slots > 0 && collapsed_edge_idx != nullptr) {
+            CHECK_CUDA(cudaMemset(collapsed_edge_idx, 0, collapse_slots * sizeof(int)));
         }
         if (n_edges > 0) {
             collapse_edge_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+            CHECK_KERNEL();
         }
 
         CHECK_CUDA(cudaMemset(n_intersect, 0, sizeof(unsigned int)));
         CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
 
+        // remove_line can grow n_collapsed further; read after both writers.
+        if (n_edges > 0) {
+            remove_invalid_faces<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+            remove_line_edge_collapse<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+            CHECK_KERNEL();
+        }
+
         int h_n_collapsed = 0;
         CHECK_CUDA(cudaMemcpy(&h_n_collapsed, n_collapsed, sizeof(int), cudaMemcpyDeviceToHost));
+        if (h_n_collapsed > (int)collapse_slots) {
+            throw std::runtime_error(
+                "collapsed_edge_idx overflow: n_collapsed=" + std::to_string(h_n_collapsed) +
+                " capacity=" + std::to_string(collapse_slots));
+        }
         if (h_n_collapsed > 0) {
             ensure_undo_scratch((size_t)h_n_collapsed);
             CHECK_CUDA(cudaMemset(edges_undo, 0, 2 * (size_t)h_n_collapsed * sizeof(int)));
+            // tmp_vertices_undo_list needs 2 entries per undo edge (and keeps prior stuck list).
+            ensure_vertices_undo_storage(
+                (size_t)std::max((size_t)first_n_vertices_undo + 2u * (size_t)h_n_collapsed,
+                                 (size_t)n_pts));
         }
 
+        // --- self-intersection check + undo collapses that introduced it ---
         if (h_n_collapsed > 0) {
-            remove_invalid_faces<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-            if (n_edges > 0) {
-                remove_line_edge_collapse<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-            }
-            // self intersection check after collapse (throws on overflow / CUDA error)
             (void)selfx::self_intersect(this, n_pts, n_tris, epsilon);
             CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
             get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
             CHECK_KERNEL();
             CHECK_CUDA(cudaDeviceSynchronize());
 
-            // get number of edges undo
             int h_n_edges_undo = 0;
             CHECK_CUDA(cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost));
             n_vertices_undo += 2 * h_n_edges_undo;
+            ensure_vertices_undo_storage((size_t)n_vertices_undo);
             int i = 0;
             while (h_n_edges_undo != 0) {
                 i++;
@@ -1086,6 +1200,7 @@ namespace cusimp_free
                 CHECK_CUDA(cudaDeviceSynchronize());
                 first_n_vertices_undo += 2 * h_n_edges_undo;
 
+                // Re-test; another batch may still intersect after partial undo.
                 (void)selfx::self_intersect(this, n_pts, n_tris, epsilon);
                 CHECK_CUDA(cudaDeviceSynchronize());
                 CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
@@ -1094,16 +1209,16 @@ namespace cusimp_free
                 CHECK_CUDA(cudaDeviceSynchronize());
                 CHECK_CUDA(cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost));
                 n_vertices_undo += 2 * h_n_edges_undo;
+                ensure_vertices_undo_storage((size_t)n_vertices_undo);
 
-                if (i == 5) break;
+                if (i == 5) break; // hard cap on undo / self-intersection rounds
             }
         }
 
+        // Compact map: exclusive_sum of occupancy -> new vertex index per old id.
         CHECK_CUDA(cudaMemcpy(pts_map, pts_occ, (n_pts + 1) * sizeof(int), cudaMemcpyDeviceToDevice));
         cub::DeviceScan::ExclusiveSum(nullptr, temp_storage_bytes, pts_map, pts_map, n_pts + 1);
         ensure_temp_storage_size(temp_storage_bytes);
         cub::DeviceScan::ExclusiveSum(temp_storage, allocated_temp_storage_size, pts_map, pts_map, n_pts + 1);
-
-        // n_intersect / SI / collapse scratch stay pooled for the next forward().
     }
 }

@@ -1,14 +1,14 @@
 #ifndef LBVH_QUERY_CUH
 #define LBVH_QUERY_CUH
 #define STACK_SIZE 256
-// Sentinel when the fixed DFS stack would overflow. Callers must hard-fail:
-// a truncated walk can miss real intersections.
+// Sentinel when the fixed depth-first stack would overflow. Callers must
+// hard-fail: a truncated walk can miss real intersections.
 #define LBVH_STACK_OVERFLOW 0xFFFFFFFFu
 #include "predicator.cuh"
 
 namespace lbvh
 {
-    // Fixed-stack DFS over the LBVH for AABB-overlap queries.
+    // Fixed-stack depth-first walk over the LBVH for AABB-overlap queries.
     //
     // Node encoding: object_idx != 0xFFFFFFFF means leaf (object = face index);
     // otherwise left_idx/right_idx are internal children. Root is always node 0.
@@ -85,9 +85,9 @@ namespace lbvh
         return num_found;
     }
 
-    // Same DFS as get_number_of_intersect_candidates, but writes each accepted
-    // partner as (query_idx, obj_idx) into outiter starting at index `first`
-    // (2 slots per pair). Stops at max_candidates pairs.
+    // Same depth-first walk as get_number_of_intersect_candidates, but writes
+    // each accepted partner as (query_idx, obj_idx) into outiter starting at
+    // index `first` (two slots per pair). Stops at max_candidates pairs.
     // On stack overflow, partial writes may already exist — host must not trust
     // the list and should treat the return as failure.
     template <typename Real, typename Objects, bool IsConst, typename OutputIterator>

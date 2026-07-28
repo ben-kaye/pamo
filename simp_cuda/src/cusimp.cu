@@ -597,14 +597,15 @@ namespace cusimp
         resize(nPts, nTris);
 
         ensure_pts_storage_size(n_pts);
+        // pts/tris are device pointers from PyTorch CUDA tensors (see pybind).
         CHECK_CUDA(cudaMemcpy(points, pts, n_pts * sizeof(Vertex<float>),
-                              cudaMemcpyHostToDevice));
+                              cudaMemcpyDeviceToDevice));
         std::vector<int> tmp(n_pts, 1);
         CHECK_CUDA(cudaMemcpy(pts_occ, tmp.data(), n_pts * sizeof(int), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemset(pts_occ+n_pts, 0, sizeof(int)));
         ensure_tris_storage_size(n_tris);
         CHECK_CUDA(cudaMemcpy(triangles, tris, n_tris * sizeof(Triangle<int>),
-                              cudaMemcpyHostToDevice));
+                              cudaMemcpyDeviceToDevice));
 
         if (init){
             thrust::device_ptr<Triangle<int>> thrust_triangles(triangles);

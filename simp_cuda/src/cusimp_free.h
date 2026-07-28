@@ -200,70 +200,76 @@ namespace cusimp_free
     size_t allocated_temp_storage_size{};
     int *__restrict__ temp_storage{}; // used for prefix sum
 
-    // near triangle list
+    // Vertex -> incident faces (compressed sparse row): faces of v are
+    //   near_tris[first_near_tris[v] .. first_near_tris[v+1])
+    // near_offset is a per-vertex fill cursor used only while building that layout.
     size_t allocated_near_count{};
-    int *__restrict__ first_near_tris{}; // link to the first triangle in the neighboring triangle list
+    int *__restrict__ first_near_tris{};
     size_t allocated_near_tris{};
-    int *__restrict__ near_tris{}; // neighboring triangle index list
+    int *__restrict__ near_tris{};
     size_t allocated_near_offset{};
-    int *__restrict__ near_offset{}; // help to fill the neighboring triangle list
+    int *__restrict__ near_offset{};
 
-    // edge list
+    // Per-face edge prefixes (first_edge) then flat undirected edge list.
     size_t allocated_edge_count{};
-    int *__restrict__ first_edge{};   // link to the first edge in the neighboring edge list
+    int *__restrict__ first_edge{};
     size_t allocated_edge{};
-    Edge<int> *__restrict__ edges{};  // edge list
+    Edge<int> *__restrict__ edges{};
 
-    // cost list
+    // Quadric error metric: per-vertex Q, per-edge cost (32-bit unsigned),
+    // per-face min packed cost (high 32 = cost, low 32 = edge index) for
+    // independent-set selection.
     size_t allocated_vert_Q{};
-    Mat4x4<float> *__restrict__ vert_Q{};   // Q matrix for each vertex
+    Mat4x4<float> *__restrict__ vert_Q{};
     size_t allocated_edge_cost{};
-    uint32_t *__restrict__ edge_cost{};     // cost for each edge
+    uint32_t *__restrict__ edge_cost{};
     size_t allocated_tri_min_cost{};
-    uint64_cu *__restrict__ tri_min_cost{};  // the data type is fixed (int32 + int32)
+    uint64_cu *__restrict__ tri_min_cost{};
 
-    // output
+    // Working mesh (starts as input; collapse rewrites in place).
     size_t allocated_pts{};
-    Vertex<float> *__restrict__ points{}; // output points (start from input points)
-    int *__restrict__ pts_occ{}; // whether points are valid
-    int *__restrict__ pts_map{}; // vert map after removing redundant points
+    Vertex<float> *__restrict__ points{};
+    int *__restrict__ pts_occ{}; // 1 = live vertex, 0 = collapsed away
+    int *__restrict__ pts_map{}; // exclusive_sum(pts_occ) compact indices
     size_t allocated_tris{};
-    Triangle<int> *__restrict__ triangles{}; // output triangles (start from input triangles)
+    Triangle<int> *__restrict__ triangles{}; // deleted faces: i=j=k=-1
 
-    // undo
-    int *n_collapsed{}; //# of collapsed edge
-    Vertex<float> *__restrict__ original_points{}; // restore buffer
-    Triangle<int> *__restrict__ original_tris{}; // restore buffer
-    uint32_t *__restrict__ original_edge_cost{};     // cost for each edge
+    // Collapse + undo. original_* is the snapshot taken at the start of forward().
+    int *n_collapsed{};
+    Vertex<float> *__restrict__ original_points{};
+    Triangle<int> *__restrict__ original_tris{};
+    uint32_t *__restrict__ original_edge_cost{};
 
-    int *__restrict__ collapsed_edge_idx{}; // index of collpsed edge
+    int *__restrict__ collapsed_edge_idx{}; // edges accepted by collapse_edge_kernel
     size_t allocated_collapsed_edge_idx{};
-    int * n_edges_undo{}; // number of undo candidate 
-    int * edges_undo{}; // edge index of undo candidate
+    int * n_edges_undo{}; // how many need self-intersection undo
+    int * edges_undo{};   // edge indices to restore
     size_t allocated_edges_undo{};
 
     int *__restrict__ vertices_undo_list{};
     int *__restrict__ tmp_vertices_undo_list{};
-    int *__restrict__ vertices_invalid_list{}; // To track invalid edge from iteration before
-    bool *__restrict__ vertices_invalid_table{}; // hashmap
+    size_t allocated_vertices_undo{}; // capacity for undo lists (can exceed n_pts)
+    int *__restrict__ vertices_invalid_list{}; // endpoints blocked on next host iter
+    bool *__restrict__ vertices_invalid_table{};
 
-    // self-intersected triangles
+    // Self-intersection output: flat face-index list (length n_intersect)
+    // that failed the triangle-triangle test.
     int * __restrict__ query_triangle_list{};
     unsigned int *__restrict__ intersected_triangle_idx{};
     int * n_intersect{};
 
-    // Pooled self-intersect scratch (reused across calls; grown as needed)
+    // Pooled self-intersect scratch (reused across calls; grown as needed).
     unsigned int *si_is_intersect{};
     unsigned int *si_total{};
     unsigned int *si_stored{};
     unsigned int *si_intersections{};
     size_t allocated_si_intersections{};
 
-    // for lbvh
-    thrust::device_vector<selfx::Triangle<float3>> bvh_triangles; // to construct bvh
-    thrust::device_vector<unsigned int> num_found_query; // key : tris, value : # of query found
-    thrust::device_vector<unsigned int> first_query_result;
-    thrust::device_vector<unsigned int> intersect_candidates;
+    // LBVH broad-phase buffers (two-pass count/scan/fill of AABB candidates).
+    thrust::device_vector<selfx::Triangle<float3>> bvh_triangles;
+    thrust::device_vector<unsigned int> num_found_query;   // per-face slot counts
+    thrust::device_vector<unsigned int> first_query_result; // exclusive_scan offsets
+    thrust::device_vector<unsigned int> intersect_candidates; // packed (query, partner) pairs
 
 
     inline __host__ void resize(int nPts, int nTris)
@@ -285,6 +291,7 @@ namespace cusimp_free
     __host__ void ensure_tri_min_cost_storage_size(size_t n_tris);
     __host__ void ensure_collapse_scratch(size_t n_edges);
     __host__ void ensure_undo_scratch(size_t n_collapsed);
+    __host__ void ensure_vertices_undo_storage(size_t n);
 
     // triangles must start from 0
     __host__ void forward(Vertex<float> *pts, Triangle<int> *tris, int* verts_undo, int n_verts_undo, int nPts, int nTris, float scale, float threshold, bool is_stuck, bool init);
