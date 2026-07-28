@@ -1,3 +1,13 @@
+"""Hinge (dihedral) energy kernels and adjacency builders.
+
+Preprocess historically launched an O(F^2) face-pair kernel. The production path
+now builds opposite-edge hinges from a sorted half-edge table in O(F log F)
+(see ``build_hinge_indices``). The slow kernel remains for parity tests.
+"""
+
+from __future__ import annotations
+
+import numpy as np
 import warp as wp
 
 
@@ -18,6 +28,91 @@ def compute_hinge_angle(x0: wp.vec3, x1: wp.vec3, x2: wp.vec3, x3: wp.vec3):
     return theta
 
 
+def build_hinge_indices(triangles: np.ndarray) -> np.ndarray:
+    """Build hinge vertex quads from triangle connectivity in O(F log F).
+
+    Each interior edge shared by two faces with opposite orientation yields one
+    hinge ``[opp0, v_lo, v_hi, opp1]`` with ``v_lo < v_hi``, matching
+    ``hinge_preprocess_slow_kernel``.
+
+    Boundary edges (one incident face) and inconsistently wound pairs produce no
+    hinge. Non-manifold edges with multiple opposite pairs contribute one hinge
+    per opposite pair (same as the slow kernel's face-pair enumeration).
+
+    Returns:
+        int32 array of shape (H, 4).
+    """
+    F = np.asarray(triangles, dtype=np.int32)
+    if F.ndim != 2 or F.shape[1] != 3:
+        raise ValueError(f"triangles must be (F, 3), got {F.shape}")
+    n_faces = F.shape[0]
+    if n_faces == 0:
+        return np.zeros((0, 4), dtype=np.int32)
+
+    # Three oriented half-edges per face: a -> b with opposite vertex opp.
+    a = F[:, [0, 1, 2]].reshape(-1)
+    b = F[:, [1, 2, 0]].reshape(-1)
+    opp = F[:, [2, 0, 1]].reshape(-1)
+
+    key_lo = np.minimum(a, b)
+    key_hi = np.maximum(a, b)
+    # Stable group order: undirected key, then orientation.
+    order = np.lexsort((b, a, key_hi, key_lo))
+    key_lo = key_lo[order]
+    key_hi = key_hi[order]
+    a = a[order]
+    b = b[order]
+    opp = opp[order]
+
+    hinges: list[list[int]] = []
+    n_he = a.shape[0]
+    i = 0
+    while i < n_he:
+        j = i + 1
+        while j < n_he and key_lo[j] == key_lo[i] and key_hi[j] == key_hi[i]:
+            j += 1
+        # Partition group into lo->hi and hi->lo half-edges.
+        fwd_opp: list[int] = []
+        bak_opp: list[int] = []
+        lo = int(key_lo[i])
+        hi = int(key_hi[i])
+        for k in range(i, j):
+            if int(a[k]) == lo and int(b[k]) == hi:
+                fwd_opp.append(int(opp[k]))
+            elif int(a[k]) == hi and int(b[k]) == lo:
+                bak_opp.append(int(opp[k]))
+        # Every opposite-orientation pair is a hinge (manifold: 1x1).
+        for o0 in fwd_opp:
+            for o1 in bak_opp:
+                hinges.append([o0, lo, hi, o1])
+        i = j
+
+    if not hinges:
+        return np.zeros((0, 4), dtype=np.int32)
+    return np.asarray(hinges, dtype=np.int32)
+
+
+@wp.kernel
+def hinge_fill_rest_kernel(
+    x_rest: wp.array(dtype=wp.vec3),
+    hinge_indices: wp.array(dtype=wp.int32, ndim=2),
+    rest_angles: wp.array(dtype=wp.float32),
+    rest_elens: wp.array(dtype=wp.float32),
+):
+    """Fill rest angle / rest edge length for prebuilt hinge indices."""
+    hid = wp.tid()
+    i0 = hinge_indices[hid, 0]
+    i1 = hinge_indices[hid, 1]
+    i2 = hinge_indices[hid, 2]
+    i3 = hinge_indices[hid, 3]
+    x0 = x_rest[i0]
+    x1 = x_rest[i1]
+    x2 = x_rest[i2]
+    x3 = x_rest[i3]
+    rest_angles[hid] = compute_hinge_angle(x0, x1, x2, x3)
+    rest_elens[hid] = wp.length(x2 - x1)
+
+
 @wp.kernel
 def hinge_preprocess_slow_kernel(
     x_rest: wp.array(dtype=wp.vec3),
@@ -27,6 +122,7 @@ def hinge_preprocess_slow_kernel(
     rest_angles: wp.array(dtype=wp.float32),
     rest_elens: wp.array(dtype=wp.float32),
 ):
+    """O(F^2) face-pair hinge discovery. Kept for tests / debug only."""
     t0, t1 = wp.tid()
 
     for e0 in range(3):

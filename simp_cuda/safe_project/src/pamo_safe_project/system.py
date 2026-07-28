@@ -35,13 +35,30 @@ class Stage3System:
                 )
 
         self._init_counters()
-        self._init_arrays()
+        self._init_capacity_fields()
+        self._init_scalar_arrays()
         self._init_energy_calcs()
 
         self.cg_solver = CGSolver(self)
         self.line_search_graph = None
-
         self.do_nothing = False
+
+        # Legacy path: reserve full max_* ceilings at construction (~5 GiB).
+        # Default auto_capacity=True defers allocation until register_mesh.
+        if not config.auto_capacity:
+            c = config
+            MF = c.max_particles * 2 + 1024
+            ME = MF // 2 * 3
+            MF_GT = c.max_gt_particles * 2 + 1024
+            self.ensure_capacity(
+                n_particles=c.max_particles,
+                n_faces=MF,
+                n_edges=ME,
+                n_gt_particles=c.max_gt_particles,
+                n_gt_faces=MF_GT,
+                n_gt_samples=c.max_gt_samples,
+                n_blocks=c.max_blocks,
+            )
 
     def _init_counters(self):
         self.n_particles = 0
@@ -51,57 +68,175 @@ class Stage3System:
         self.n_gt_triangles = 0
         self.n_gt_samples = 0
 
-    def _init_arrays(self):
-        MP = self.config.max_particles
-        MP_GT = self.config.max_gt_particles
-        MS_GT = self.config.max_gt_samples
-        MF = (
-            self.config.max_particles * 2 + 1024
-        )  # max number of faces, assume < 256 genus
-        MF_GT = self.config.max_gt_particles * 2 + 1024
-        ME = MF // 2 * 3  # max number of edges
-        MB = self.config.max_blocks
+    def _init_capacity_fields(self):
+        """Allocated buffer capacities (not mesh counts). Start at 0 under auto_capacity."""
+        self.cap_particles = 0
+        self.cap_faces = 0
+        self.cap_edges = 0
+        self.cap_gt_particles = 0
+        self.cap_gt_faces = 0
+        self.cap_gt_samples = 0
+        self.cap_blocks = 0
 
+    def _init_scalar_arrays(self):
+        """Tiny always-present buffers; heavy mesh/contact arrays come from ensure_capacity."""
         with wp.ScopedDevice(self.device):
-            self.q = wp.zeros(MP, dtype=wp.vec3)
-            self.q_prev_newton = wp.zeros(MP, dtype=wp.vec3)
-            self.q_prev_detection = wp.zeros(MP, dtype=wp.vec3)
-            self.q_rest = wp.zeros(MP, dtype=wp.vec3)
-            self.p = wp.zeros(MP, dtype=wp.vec3)  # update on q in each Newton iteration
-
-            # GT mesh data
-            self.gt_vertices = wp.zeros(MP_GT, dtype=wp.vec3)
-            self.gt_triangles = wp.zeros((MF_GT, 3), dtype=wp.int32)
-            self.gt_samples = wp.zeros(MS_GT, dtype=wp.vec3)
-            self.gt_sample_weights = wp.zeros(MS_GT, dtype=wp.float32)
-
-            # Remeshed mesh data
-            self.triangles = wp.zeros((MF, 3), dtype=wp.int32)
-            self.edges = wp.zeros((ME, 2), dtype=wp.int32)
-            self.voronoi_areas = wp.zeros(MP, dtype=wp.float32)
-
-            # System-wise energy and its differentials
             self.energy = wp.zeros(1, dtype=wp.float32)
             self.energy_prev = wp.zeros(1, dtype=wp.float32)
-            self.grad = wp.zeros(MP, dtype=wp.vec3)
-            self.hess_diag = wp.zeros(MP, dtype=wp.vec3)
-
-            # CCD
             self.ccd_step = wp.zeros(1, dtype=wp.float32)
+            # Placeholders until first ensure_capacity (Warp allows length-0 arrays).
+            self.q = wp.zeros(0, dtype=wp.vec3)
+            self.q_prev_newton = wp.zeros(0, dtype=wp.vec3)
+            self.q_prev_detection = wp.zeros(0, dtype=wp.vec3)
+            self.q_rest = wp.zeros(0, dtype=wp.vec3)
+            self.p = wp.zeros(0, dtype=wp.vec3)
+            self.grad = wp.zeros(0, dtype=wp.vec3)
+            self.hess_diag = wp.zeros(0, dtype=wp.vec3)
+            self.voronoi_areas = wp.zeros(0, dtype=wp.float32)
+            self.triangles = wp.zeros((0, 3), dtype=wp.int32)
+            self.edges = wp.zeros((0, 2), dtype=wp.int32)
+            self.gt_vertices = wp.zeros(0, dtype=wp.vec3)
+            self.gt_triangles = wp.zeros((0, 3), dtype=wp.int32)
+            self.gt_samples = wp.zeros(0, dtype=wp.vec3)
+            self.gt_sample_weights = wp.zeros(0, dtype=wp.float32)
+            self.edge_lowers = wp.zeros(0, dtype=wp.vec3)
+            self.edge_uppers = wp.zeros(0, dtype=wp.vec3)
+            self.tri_lowers = wp.zeros(0, dtype=wp.vec3)
+            self.tri_uppers = wp.zeros(0, dtype=wp.vec3)
 
-            # # Curvature energy
-            # self.curv_rest = wp.zeros(MP, dtype=wp.vec3)  # mean curvature at rest
-            # self.curv_pids = wp.zeros(2 * ME + MP, dtype=wp.int32)
-            # self.curv_indptr = wp.zeros(MP + 1, dtype=wp.int32)
-            # self.curv_data = wp.zeros(2 * ME + MP, dtype=wp.float32)
+    @staticmethod
+    def _grow_cap(need: int, old: int, growth: float, ceiling: int, name: str) -> int:
+        """Return a capacity >= need, growing geometrically from old, capped by ceiling."""
+        if need <= 0:
+            return old
+        if need <= old:
+            return old
+        if ceiling > 0 and need > ceiling:
+            raise RuntimeError(
+                f"Stage3 capacity overflow: need {need} for {name}, hard limit is {ceiling}"
+            )
+        if old <= 0:
+            # First allocation: modest headroom so a slightly larger next mesh reuses.
+            new = max(need + need // 4 + 64, need)
+        else:
+            new = old
+            while new < need:
+                nxt = max(int(new * growth), new + 1)
+                if nxt <= new:
+                    nxt = new + need
+                new = nxt
+        if ceiling > 0:
+            new = min(new, ceiling)
+        return new
 
-            # BVH
-            self.edge_lowers = wp.zeros(ME, dtype=wp.vec3)
-            self.edge_uppers = wp.zeros(ME, dtype=wp.vec3)
-            self.tri_lowers = wp.zeros(MF, dtype=wp.vec3)
-            self.tri_uppers = wp.zeros(MF, dtype=wp.vec3)
-            # self.gt_tri_lowers = wp.zeros(MF_GT, dtype=wp.vec3)
-            # self.gt_tri_uppers = wp.zeros(MF_GT, dtype=wp.vec3)
+    def ensure_capacity(
+        self,
+        n_particles: int = 0,
+        n_faces: int = 0,
+        n_edges: int = 0,
+        n_gt_particles: int = 0,
+        n_gt_faces: int = 0,
+        n_gt_samples: int = 0,
+        n_blocks: int = 0,
+    ) -> bool:
+        """Grow mesh/contact buffers if any requested size exceeds current capacity.
+
+        Returns True if any buffer was reallocated (CUDA graphs are invalidated).
+        """
+        c = self.config
+        growth = float(getattr(c, "capacity_growth", 2.0))
+
+        # Face/edge hard limits derived from max_particles / max_gt_particles
+        # (same formulas as the old eager allocator).
+        face_ceiling = c.max_particles * 2 + 1024
+        edge_ceiling = face_ceiling // 2 * 3
+        gt_face_ceiling = c.max_gt_particles * 2 + 1024
+
+        new_MP = self._grow_cap(n_particles, self.cap_particles, growth, c.max_particles, "particles")
+        new_MF = self._grow_cap(n_faces, self.cap_faces, growth, face_ceiling, "faces")
+        new_ME = self._grow_cap(n_edges, self.cap_edges, growth, edge_ceiling, "edges")
+        new_MP_GT = self._grow_cap(
+            n_gt_particles, self.cap_gt_particles, growth, c.max_gt_particles, "gt_particles"
+        )
+        new_MF_GT = self._grow_cap(
+            n_gt_faces, self.cap_gt_faces, growth, gt_face_ceiling, "gt_faces"
+        )
+        new_MS_GT = self._grow_cap(
+            n_gt_samples, self.cap_gt_samples, growth, c.max_gt_samples, "gt_samples"
+        )
+        new_MB = self._grow_cap(n_blocks, self.cap_blocks, growth, c.max_blocks, "blocks")
+
+        grow_P = new_MP > self.cap_particles
+        grow_F = new_MF > self.cap_faces
+        grow_E = new_ME > self.cap_edges
+        grow_P_GT = new_MP_GT > self.cap_gt_particles
+        grow_F_GT = new_MF_GT > self.cap_gt_faces
+        grow_S_GT = new_MS_GT > self.cap_gt_samples
+        grow_B = new_MB > self.cap_blocks
+
+        if not any((grow_P, grow_F, grow_E, grow_P_GT, grow_F_GT, grow_S_GT, grow_B)):
+            return False
+
+        logger.debug(
+            "Stage3 ensure_capacity: "
+            f"P {self.cap_particles}->{new_MP}, F {self.cap_faces}->{new_MF}, "
+            f"E {self.cap_edges}->{new_ME}, P_GT {self.cap_gt_particles}->{new_MP_GT}, "
+            f"F_GT {self.cap_gt_faces}->{new_MF_GT}, S_GT {self.cap_gt_samples}->{new_MS_GT}, "
+            f"B {self.cap_blocks}->{new_MB}"
+        )
+
+        with wp.ScopedDevice(self.device):
+            if grow_P:
+                self.q = wp.zeros(new_MP, dtype=wp.vec3)
+                self.q_prev_newton = wp.zeros(new_MP, dtype=wp.vec3)
+                self.q_prev_detection = wp.zeros(new_MP, dtype=wp.vec3)
+                self.q_rest = wp.zeros(new_MP, dtype=wp.vec3)
+                self.p = wp.zeros(new_MP, dtype=wp.vec3)
+                self.grad = wp.zeros(new_MP, dtype=wp.vec3)
+                self.hess_diag = wp.zeros(new_MP, dtype=wp.vec3)
+                self.voronoi_areas = wp.zeros(new_MP, dtype=wp.float32)
+                self.cap_particles = new_MP
+
+            if grow_F:
+                self.triangles = wp.zeros((new_MF, 3), dtype=wp.int32)
+                self.tri_lowers = wp.zeros(new_MF, dtype=wp.vec3)
+                self.tri_uppers = wp.zeros(new_MF, dtype=wp.vec3)
+                self.cap_faces = new_MF
+
+            if grow_E:
+                self.edges = wp.zeros((new_ME, 2), dtype=wp.int32)
+                self.edge_lowers = wp.zeros(new_ME, dtype=wp.vec3)
+                self.edge_uppers = wp.zeros(new_ME, dtype=wp.vec3)
+                self.cap_edges = new_ME
+
+            if grow_P_GT:
+                self.gt_vertices = wp.zeros(new_MP_GT, dtype=wp.vec3)
+                self.cap_gt_particles = new_MP_GT
+
+            if grow_F_GT:
+                self.gt_triangles = wp.zeros((new_MF_GT, 3), dtype=wp.int32)
+                self.cap_gt_faces = new_MF_GT
+
+            if grow_S_GT:
+                self.gt_samples = wp.zeros(new_MS_GT, dtype=wp.vec3)
+                self.gt_sample_weights = wp.zeros(new_MS_GT, dtype=wp.float32)
+                self.cap_gt_samples = new_MS_GT
+
+            if grow_B:
+                self.cap_blocks = new_MB
+
+        # Dependent buffers (CG + energy calculators) and graph invalidation.
+        if hasattr(self, "cg_solver") and self.cg_solver is not None:
+            self.cg_solver.ensure_capacity()
+            self.cg_solver.clear()
+        self.line_search_graph = None
+
+        if hasattr(self, "energy_calcs"):
+            for ec in self.energy_calcs.values():
+                if hasattr(ec, "ensure_capacity"):
+                    ec.ensure_capacity()
+
+        return True
 
     def clear(self):
         self._init_counters()
@@ -110,6 +245,8 @@ class Stage3System:
         for k in self.config.energy_calcs:
             if not k in self.energy_calcs:
                 self.energy_calcs[k] = k(self)
+                if hasattr(self.energy_calcs[k], "ensure_capacity"):
+                    self.energy_calcs[k].ensure_capacity()
         self.do_nothing = False
 
     def _get_energy_calculator(self, cls: type):
@@ -184,6 +321,23 @@ class Stage3System:
 
         NP, NT, NE = self.n_particles, self.n_triangles, self.n_edges
         NP_GT, NT_GT = self.n_gt_particles, self.n_gt_triangles
+
+        # Mesh-sized allocation (Phase B P1-2). Contact buffer heuristic scales
+        # with edges; overflow grows geometrically inside detect_contact.
+        n_blocks_hint = max(
+            int(getattr(c, "min_blocks", 1 << 16)),
+            NE * int(getattr(c, "blocks_per_edge", 16)),
+            NP * int(getattr(c, "blocks_per_edge", 16)),
+        )
+        self.ensure_capacity(
+            n_particles=NP,
+            n_faces=NT,
+            n_edges=NE,
+            n_gt_particles=NP_GT,
+            n_gt_faces=NT_GT,
+            n_gt_samples=c.max_gt_samples,
+            n_blocks=n_blocks_hint,
+        )
 
         wp_slice(self.q, 0, NP).assign(V)
         wp_slice(self.q_rest, 0, NP).assign(V)

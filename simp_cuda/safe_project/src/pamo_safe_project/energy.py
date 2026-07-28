@@ -34,6 +34,10 @@ class EnergyCalculator:
     def __init__(self, system: Stage3System):
         self.system = system
 
+    def ensure_capacity(self):
+        """(Re)allocate workspaces to match system capacities. Default: no-op."""
+        pass
+
     def preprocess(self, V, F):
         pass
 
@@ -69,15 +73,22 @@ class DummyEnergyCalculator(EnergyCalculator):
 
     def __init__(self, system: Stage3System):
         super().__init__(system)
-        
+        self.A_np = None
+        self.b_np = None
+        self.c_np = None
+        self.ensure_capacity()
+
+    def ensure_capacity(self):
         s = self.system
         c = s.config
-
-        MP = c.max_particles
+        MP = max(int(s.cap_particles), int(c.max_particles) if not c.auto_capacity else 0)
+        if MP <= 0:
+            MP = int(c.max_particles)
         assert (
             MP <= 1024
         ), f"Dummy energy calculator only supports max_particles <= 1024, got max_particles = {MP}"
-
+        if self.A_np is not None and self.A_np.shape[0] == MP * 3:
+            return
         self.A_np = np.random.randn(MP * 3, MP * 3)
         self.A_np = self.A_np.T @ self.A_np
         self.b_np = np.random.randn(MP * 3)
@@ -113,16 +124,26 @@ class Mesh2GTDistanceEnergyCalculator(EnergyCalculator):
     name = "M2GT"
     def __init__(self, system: Stage3System):
         super().__init__(system)
+        self.target = None
+        self.target_distance = None
+        self._cap_particles = 0
+        self.ensure_capacity()
 
+    def ensure_capacity(self):
         s = self.system
-        c = s.config
-
-        MP = c.max_particles
-
-        # Distance energy
+        MP = max(int(s.cap_particles), 0)
+        if MP <= 0:
+            with wp.ScopedDevice(s.device):
+                if self.target is None:
+                    self.target = wp.zeros(0, dtype=wp.vec3)
+                    self.target_distance = wp.zeros(0, dtype=wp.float32)
+            return
+        if self._cap_particles >= MP and self.target is not None:
+            return
         with wp.ScopedDevice(s.device):
-            self.target = wp.zeros(MP, dtype=wp.vec3)  # L2 distance energy target
+            self.target = wp.zeros(MP, dtype=wp.vec3)
             self.target_distance = wp.zeros(MP, dtype=wp.float32)
+        self._cap_particles = MP
 
     def update_target(self, x: wp.array):
         s = self.system
@@ -218,17 +239,32 @@ class GT2MeshDistanceEnergyCalculator(EnergyCalculator):
 
     def __init__(self, system: Stage3System):
         super().__init__(system)
+        self.closest_tids = None
+        self.pt_types = None
+        self.d = None
+        self.dd_dx = None
+        self._cap_gt_samples = 0
+        self.ensure_capacity()
 
+    def ensure_capacity(self):
         s = self.system
-        c = s.config
-
-        MS_GT = c.max_gt_samples
-
+        MS_GT = max(int(s.cap_gt_samples), 0)
+        if MS_GT <= 0:
+            with wp.ScopedDevice(s.device):
+                if self.closest_tids is None:
+                    self.closest_tids = wp.zeros(0, dtype=wp.int32)
+                    self.pt_types = wp.zeros(0, dtype=wp.int32)
+                    self.d = wp.zeros(0, dtype=wp.float32)
+                    self.dd_dx = wp.zeros((0, 4), dtype=wp.vec3)
+            return
+        if self._cap_gt_samples >= MS_GT and self.closest_tids is not None:
+            return
         with wp.ScopedDevice(s.device):
             self.closest_tids = wp.zeros(MS_GT, dtype=wp.int32)
             self.pt_types = wp.zeros(MS_GT, dtype=wp.int32)
             self.d = wp.zeros(MS_GT, dtype=wp.float32)
             self.dd_dx = wp.zeros((MS_GT, 4), dtype=wp.vec3)
+        self._cap_gt_samples = MS_GT
 
     def update_target(self, x: wp.array):
         s = self.system
@@ -350,28 +386,33 @@ class ElasticEnergyCalculator(EnergyCalculator):
         s = self.system
         c = s.config
 
-        MP = c.max_particles
-        MT = 2 * MP + 1024
-
         self.mu = c.elas_young_modulus / (2 * (1 + c.elas_poisson_ratio))
         self.la = (
             c.elas_young_modulus
             * c.elas_poisson_ratio
             / ((1 + c.elas_poisson_ratio) * (1 - 2 * c.elas_poisson_ratio))
         )
+        self.areas = None
+        self.inv_Dm = None
+        self._cap_faces = 0
+        self.ensure_capacity()
+        # Elastic: F = Ds * inv(Dm); forces from Piola stress on each triangle.
 
+    def ensure_capacity(self):
+        s = self.system
+        MT = max(int(s.cap_faces), 0)
+        if MT <= 0:
+            with wp.ScopedDevice(s.device):
+                if self.areas is None:
+                    self.areas = wp.zeros(0, dtype=wp.float32)
+                    self.inv_Dm = wp.zeros(0, dtype=wp.mat22)
+            return
+        if self._cap_faces >= MT and self.areas is not None:
+            return
         with wp.ScopedDevice(s.device):
             self.areas = wp.zeros(MT, dtype=wp.float32)
             self.inv_Dm = wp.zeros(MT, dtype=wp.mat22)
-            """ xm_local = Bm * x
-                Dm = Bm * [xm1 - xm0, xm2 - xm0]
-                Ds = Bs * [xs1 - xs0, xs2 - xs0]
-                W = 0.5 * det(Dm)
-                F = Ds * inv(Dm)  # local deformation gradient, \partial (Bs * xs) / \partial (Bm * xm)
-                [f1, f2] = H = -W * P(F) * inv(Dm).T  # local force, \partial E / \partial (Bs * xs)
-                # Note that Psi(RF) = Psi(F), d Psi(F) = d Psi(RF) = P(PF) : (R * dF) = R^T * P(RF) : dF = P(F) : dF
-                # So P(RF) = R * P(F)
-            """
+        self._cap_faces = MT
 
     def preprocess(self, V, F):
         s = self.system
@@ -471,25 +512,44 @@ class LBCurvatureEnergyCalculator(EnergyCalculator):
     
     def __init__(self, system: Stage3System):
         super().__init__(system)
-        
+        self.LB_nnz = 0
+        self.LB_indices = None
+        self.LB_indptr = None
+        self.LB_data = None
+        self.curv_rest = None
+        self.curv = None
+        self._cap_particles = 0
+        self._cap_lb_nnz = 0
+        self.ensure_capacity()
+
+    def ensure_capacity(self):
         s = self.system
-        c = s.config
-
-        MP = c.max_particles
-        MT = 2 * MP + 1024
-        ME = MT // 2 * 3
+        MP = max(int(s.cap_particles), 0)
+        ME = max(int(s.cap_edges), 0)
         M_LB_nnz = 2 * ME + MP
-
+        if MP <= 0:
+            with wp.ScopedDevice(s.device):
+                if self.LB_indices is None:
+                    self.LB_indices = wp.zeros(0, dtype=wp.int32)
+                    self.LB_indptr = wp.zeros(1, dtype=wp.int32)
+                    self.LB_data = wp.zeros(0, dtype=wp.float32)
+                    self.curv_rest = wp.zeros(0, dtype=wp.float32)
+                    self.curv = wp.zeros(0, dtype=wp.vec3)
+            return
+        if (
+            self._cap_particles >= MP
+            and self._cap_lb_nnz >= M_LB_nnz
+            and self.LB_indices is not None
+        ):
+            return
         with wp.ScopedDevice(s.device):
-            self.LB_nnz = 0
-
             self.LB_indices = wp.zeros(M_LB_nnz, dtype=wp.int32)
             self.LB_indptr = wp.zeros(MP + 1, dtype=wp.int32)
-            self.LB_data = wp.zeros(
-                M_LB_nnz, dtype=wp.float32
-            )  # Laplace-Beltrami operator
+            self.LB_data = wp.zeros(M_LB_nnz, dtype=wp.float32)
             self.curv_rest = wp.zeros(MP, dtype=wp.float32)
             self.curv = wp.zeros(MP, dtype=wp.vec3)
+        self._cap_particles = MP
+        self._cap_lb_nnz = M_LB_nnz
 
     def preprocess(self, V, F):
         s = self.system
@@ -590,54 +650,96 @@ class HingeEnergyCalculator(EnergyCalculator):
     
     def __init__(self, system: Stage3System):
         super().__init__(system)
+        self.rest_angles = None
+        self.rest_elens = None
+        self.blocks = None
+        self.block_indices = None
+        self._cap_edges = 0
+        self.n_hinges = 0
+        self.ensure_capacity()
 
+    def ensure_capacity(self):
         s = self.system
-        c = s.config
-
-        MP = c.max_particles
-        MT = 2 * MP + 1024
-        ME = MT // 2 * 3
-
+        ME = max(int(s.cap_edges), 0)
+        if ME <= 0:
+            with wp.ScopedDevice(s.device):
+                if self.rest_angles is None:
+                    self.rest_angles = wp.zeros(0, dtype=wp.float32)
+                    self.rest_elens = wp.zeros(0, dtype=wp.float32)
+                    self.blocks = wp.zeros((0, 4, 4), dtype=wp.mat33)
+                    self.block_indices = wp.zeros((0, 4), dtype=wp.int32)
+            return
+        if self._cap_edges >= ME and self.rest_angles is not None:
+            return
         with wp.ScopedDevice(s.device):
             self.rest_angles = wp.zeros(ME, dtype=wp.float32)
             self.rest_elens = wp.zeros(ME, dtype=wp.float32)
             self.blocks = wp.zeros((ME, 4, 4), dtype=wp.mat33)
             self.block_indices = wp.zeros((ME, 4), dtype=wp.int32)
+        self._cap_edges = ME
 
     def preprocess(self, V, F):
+        """Discover hinges via sorted half-edge table (O(F log F)), not O(F^2)."""
         s = self.system
         c = s.config
 
-        hinge_counter = wp.zeros(1, dtype=wp.int32)
+        # Prefer mesh faces passed into preprocess; fall back to device triangles.
+        if F is not None:
+            tris = np.asarray(F, dtype=np.int32)
+        else:
+            tris = s.triangles.numpy()[: s.n_triangles]
 
+        hinge_idx = build_hinge_indices(tris)
+        n_hinges = int(hinge_idx.shape[0])
+        self.n_hinges = n_hinges
+
+        # Unique-edge capacity is the manifold upper bound; non-manifold opposite
+        # pairs can exceed it — grow before writing.
+        if n_hinges > self._cap_edges:
+            s.ensure_capacity(n_edges=max(int(s.n_edges), n_hinges))
+            self.ensure_capacity()
+        if n_hinges > self._cap_edges:
+            raise RuntimeError(
+                f"Hinge count {n_hinges} exceeds edge capacity {self._cap_edges} "
+                f"(n_edges={s.n_edges}, n_faces={s.n_triangles})"
+            )
+
+        if n_hinges != s.n_edges:
+            # Boundary / open meshes: unique edges include non-hinge boundary edges.
+            # Non-manifold meshes may also diverge. Launch dims use n_hinges.
+            logger.warning(
+                f"Hinge count {n_hinges} != unique edges {s.n_edges} "
+                f"(boundary or non-manifold geometry); using n_hinges for Bend energy"
+            )
+
+        if n_hinges == 0:
+            return
+
+        wp_slice(self.block_indices, 0, n_hinges).assign(hinge_idx)
         wp.launch(
-            kernel=hinge_preprocess_slow_kernel,
-            dim=(s.n_triangles, s.n_triangles),
+            kernel=hinge_fill_rest_kernel,
+            dim=n_hinges,
             inputs=[
                 s.q_rest,
-                s.triangles,
+                self.block_indices,
             ],
             outputs=[
-                hinge_counter,
-                self.block_indices,
                 self.rest_angles,
                 self.rest_elens,
             ],
             device=s.device,
         )
 
-        n_hinges = hinge_counter.numpy()[0]
-        assert (
-            n_hinges == s.n_edges
-        ), f"Number of hinges {n_hinges} != number of edges {s.n_edges}"
-
     def compute_energy(self, x: wp.array, energy: wp.array):
         s = self.system
         c = s.config
+        n_h = self.n_hinges
+        if n_h <= 0:
+            return
 
         wp.launch(
             kernel=hinge_energy_kernel,
-            dim=s.n_edges,
+            dim=n_h,
             inputs=[
                 x,
                 self.block_indices,
@@ -656,10 +758,13 @@ class HingeEnergyCalculator(EnergyCalculator):
     ):
         s = self.system
         c = s.config
+        n_h = self.n_hinges
+        if n_h <= 0:
+            return
         
         wp.launch(
             kernel=hinge_diff_kernel,
-            dim=s.n_edges,
+            dim=n_h,
             inputs=[
                 x,
                 self.block_indices,
@@ -677,7 +782,7 @@ class HingeEnergyCalculator(EnergyCalculator):
         )
         wp.launch(
             kernel=block_spd_project_kernel,
-            dim=s.n_edges,
+            dim=n_h,
             inputs=[
                 self.blocks,
                 c.spd_max_iters,
@@ -688,10 +793,13 @@ class HingeEnergyCalculator(EnergyCalculator):
     def compute_hess_dx(self, x: wp.array, dx: wp.array, hess_dx: wp.array):
         s = self.system
         c = s.config
+        n_h = self.n_hinges
+        if n_h <= 0:
+            return
         
         wp.launch(
             kernel=hinge_hess_dx_kernel,
-            dim=s.n_edges,
+            dim=n_h,
             inputs=[
                 self.block_indices,
                 self.blocks,
@@ -708,28 +816,75 @@ class CollisionEnergyCalculator(EnergyCalculator):
     
     def __init__(self, system: Stage3System):
         super().__init__(system)
-        
         s = self.system
-        c = s.config
-
-        MP = c.max_particles
-        MB = c.max_blocks
-
-        # Collision energy
         with wp.ScopedDevice(s.device):
             self.contact_counter = wp.zeros(1, dtype=wp.int32)
+        self.block_indices = None
+        self.block_types = None
+        self.d = None
+        self.dd_dx = None
+        self._cap_blocks = 0
+        self.ensure_capacity()
+
+    def ensure_capacity(self):
+        s = self.system
+        MB = max(int(s.cap_blocks), 0)
+        if MB <= 0:
+            with wp.ScopedDevice(s.device):
+                if self.block_indices is None:
+                    self.block_indices = wp.zeros((0, 4), dtype=wp.int32)
+                    self.block_types = wp.zeros((0, 2), dtype=wp.int32)
+                    self.d = wp.zeros(0, dtype=wp.float32)
+                    self.dd_dx = wp.zeros((0, 4), dtype=wp.vec3)
+            return
+        if self._cap_blocks >= MB and self.block_indices is not None:
+            return
+        with wp.ScopedDevice(s.device):
             self.block_indices = wp.zeros((MB, 4), dtype=wp.int32)
-            self.block_types = wp.zeros((MB, 2), dtype=wp.int32)  # 2 hierarchy levels
-            self.d = wp.zeros(MB, dtype=wp.float32)  # distance
+            self.block_types = wp.zeros((MB, 2), dtype=wp.int32)
+            self.d = wp.zeros(MB, dtype=wp.float32)
             self.dd_dx = wp.zeros((MB, 4), dtype=wp.vec3)
+        self._cap_blocks = MB
             
     def preprocess(self, V, F):
         c = self.system.config
         self.radius = c.contact_detection_radius
 
+    def _handle_contact_overflow(self, n_contacts: int, x: wp.array) -> bool:
+        """Grow contact buffer if possible; else shrink radius. Returns True if retried."""
+        s = self.system
+        c = s.config
+        cap = s.cap_blocks
+        if n_contacts <= cap:
+            return False
+
+        logger.warning(
+            f"Number of contacts ({n_contacts}) exceeds contact capacity ({cap})"
+        )
+        # Prefer growing the buffer (Phase B) over silently thinning the contact set.
+        if cap < c.max_blocks:
+            # Need at least n_contacts slots; geometric growth may overshoot.
+            need = min(c.max_blocks, max(n_contacts, int(cap * c.capacity_growth) if cap > 0 else n_contacts))
+            if need > cap:
+                logger.info(f"Growing contact buffer {cap} -> {need}")
+                s.ensure_capacity(n_blocks=need)
+                self.detect_contact(x)
+                return True
+
+        self.radius /= 2.0
+        logger.info(f"Retrying with smaller detection radius: {self.radius}")
+        if self.radius < 1e-12:
+            raise RuntimeError(
+                f"Contact buffer full ({n_contacts} > {cap}) and detection radius "
+                f"collapsed; raise max_blocks or reduce contact density"
+            )
+        self.detect_contact(x)
+        return True
+
     def detect_contact(self, x: wp.array):
         s = self.system
         c = s.config
+        MB = s.cap_blocks
 
         self.contact_counter.zero_()
         wp.launch(
@@ -737,7 +892,7 @@ class CollisionEnergyCalculator(EnergyCalculator):
             dim=(s.n_particles, s.n_triangles),
             inputs=[
                 self.contact_counter,
-                c.max_blocks,
+                MB,
                 x,
                 s.triangles,
                 c.d_hat,
@@ -754,7 +909,7 @@ class CollisionEnergyCalculator(EnergyCalculator):
             dim=(s.n_edges, s.n_edges),
             inputs=[
                 self.contact_counter,
-                c.max_blocks,
+                MB,
                 x,
                 s.edges,
                 c.d_hat,
@@ -768,28 +923,19 @@ class CollisionEnergyCalculator(EnergyCalculator):
             device=s.device,
         )
 
-        # if c.debug:
         n_contacts = self.contact_counter.numpy()[0]
         logger.debug(f"Detected {n_contacts} contact pairs")
-        if n_contacts > c.max_blocks:
-            logger.warning(
-                f"Number of contacts ({n_contacts}) exceeds max_blocks ({c.max_blocks})"
-            )
-            self.radius /= 2.0
-            logger.info(f"Retrying with smaller detection radius: {self.radius}")
-            self.detect_contact(x)
-        # assert (
-        #     n_contacts <= c.max_blocks
-        # ), f"Number of contacts ({n_contacts}) exceeds max_blocks ({c.max_blocks})"
-        # logger.debug(f"Detected {n_contacts} contact pairs")
+        if self._handle_contact_overflow(n_contacts, x):
+            return
 
     def ccd(self, x: wp.array, v: wp.array, ccd_step: wp.array):
         s = self.system
         c = s.config
+        MB = s.cap_blocks
 
         wp.launch(
             kernel=accd_kernel,
-            dim=c.max_blocks,
+            dim=MB,
             inputs=[
                 self.contact_counter,
                 x,
@@ -810,10 +956,11 @@ class CollisionEnergyCalculator(EnergyCalculator):
     def compute_energy(self, x: wp.array, energy: wp.array):
         s = self.system
         c = s.config
+        MB = s.cap_blocks
 
         wp.launch(
             kernel=collision_energy_kernel,
-            dim=c.max_blocks,
+            dim=MB,
             inputs=[
                 x,
                 self.contact_counter,
@@ -835,10 +982,11 @@ class CollisionEnergyCalculator(EnergyCalculator):
     ):
         s = self.system
         c = s.config
+        MB = s.cap_blocks
 
         wp.launch(
             kernel=collision_diff_kernel,
-            dim=c.max_blocks,
+            dim=MB,
             inputs=[
                 x,
                 self.contact_counter,
@@ -857,17 +1005,14 @@ class CollisionEnergyCalculator(EnergyCalculator):
             device=s.device,
         )
 
-        # if c.debug:
-        #     blocks_np = self.blocks.numpy()[: self.contact_counter.numpy()[0]]
-        #     assert not np.isnan(blocks_np).any(), "NaN in Hessian blocks"
-
     def compute_hess_dx(self, x: wp.array, dx: wp.array, hess_dx: wp.array):
         s = self.system
         c = s.config
+        MB = s.cap_blocks
 
         wp.launch(
             kernel=collision_hess_dx_kernel,
-            dim=c.max_blocks,
+            dim=MB,
             inputs=[
                 self.contact_counter,
                 self.block_indices,
@@ -894,6 +1039,7 @@ class CollisionBvhEnergyCalculator(CollisionEnergyCalculator):
     def detect_contact(self, x: wp.array):
         s = self.system
         c = s.config
+        MB = s.cap_blocks
 
         self.contact_counter.zero_()
         wp.launch(
@@ -902,7 +1048,7 @@ class CollisionBvhEnergyCalculator(CollisionEnergyCalculator):
             inputs=[
                 s.tri_bvh.id,
                 self.contact_counter,
-                c.max_blocks,
+                MB,
                 x,
                 s.triangles,
                 c.d_hat,
@@ -920,7 +1066,7 @@ class CollisionBvhEnergyCalculator(CollisionEnergyCalculator):
             inputs=[
                 s.edge_bvh.id,
                 self.contact_counter,
-                c.max_blocks,
+                MB,
                 x,
                 s.edges,
                 c.d_hat,
@@ -934,16 +1080,10 @@ class CollisionBvhEnergyCalculator(CollisionEnergyCalculator):
             device=s.device,
         )
 
-        # if c.debug:
         n_contacts = self.contact_counter.numpy()[0]
         logger.debug(f"Detected {n_contacts} contact pairs")
-        if n_contacts > c.max_blocks:
-            logger.warning(
-                f"Number of contacts ({n_contacts}) exceeds max_blocks ({c.max_blocks})"
-            )
-            self.radius /= 2.0
-            logger.info(f"Retrying with smaller detection radius: {self.radius}")
-            self.detect_contact(x)
+        if self._handle_contact_overflow(n_contacts, x):
+            return
             
 
 class CollisionWoBufferEnergyCalculator(EnergyCalculator):

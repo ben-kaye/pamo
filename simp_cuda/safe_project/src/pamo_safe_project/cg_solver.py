@@ -1,10 +1,3 @@
-"""
-    References:
-    - "IPC paper": Li, Minchen, Zachary Ferguson, Teseo Schneider, Timothy R. Langlois, Denis Zorin, Daniele Panozzo, Chenfanfu Jiang, and Danny M. Kaufman. "Incremental potential contact: intersection-and inversion-free, large-deformation dynamics." ACM Trans. Graph. 39, no. 4 (2020): 49.
-    - "CG slides": Xu, Zhiliang. "ACMS 40212/60212: Advanced Scientific Computing, Lecture 8: Fast Linear Solvers (Part 5)." (https://www3.nd.edu/~zxu2/acms60212-40212/Lec-09-5.pdf)
-    - "FEM tutorial": Sifakis, Eftychios. "FEM simulation of 3D deformable solids: a practitioner's guide to theory, discretization and model reduction. Part One: The classical FEM method and discretization methodology." In Acm siggraph 2012 courses, pp. 1-50. 2012.
-"""
-
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
@@ -23,23 +16,48 @@ from .utils import wp_slice
 class CGSolver:
     def __init__(self, system: Stage3System):
         self.system = system
-        config = system.config
-
         self.graph = None
+        self.r = None
+        self.v = None
+        self.A_v = None
+        self.v_A_v = None
+        self.z = None
+        self.z_r_last = None
+        self.z_r = None
+        self._cap_particles = 0
+        self.ensure_capacity()
 
-        MP = config.max_particles
-        MB = config.max_blocks
+    def ensure_capacity(self):
+        """(Re)allocate CG workspaces to match system.cap_particles."""
+        MP = max(int(self.system.cap_particles), 0)
+        if MP <= 0:
+            # Keep scalar workspaces so early-exit paths can still touch them.
+            with wp.ScopedDevice(self.system.device):
+                if self.v_A_v is None:
+                    self.v_A_v = wp.zeros(1, dtype=wp.float32)
+                    self.z_r_last = wp.zeros(1, dtype=wp.float32)
+                    self.z_r = wp.zeros(1, dtype=wp.float32)
+                if self.r is None:
+                    self.r = wp.zeros(0, dtype=wp.vec3)
+                    self.v = wp.zeros(0, dtype=wp.vec3)
+                    self.A_v = wp.zeros(0, dtype=wp.vec3)
+                    self.z = wp.zeros(0, dtype=wp.vec3)
+            return
+        if self._cap_particles >= MP and self.r is not None:
+            return
 
         with wp.ScopedDevice(self.system.device):
             self.r = wp.zeros(MP, dtype=wp.vec3)
             self.v = wp.zeros(MP, dtype=wp.vec3)
             self.A_v = wp.zeros(MP, dtype=wp.vec3)
-            self.v_A_v = wp.zeros(1, dtype=wp.float32)
-
             self.z = wp.zeros(MP, dtype=wp.vec3)
-            self.z_r_last = wp.zeros(1, dtype=wp.float32)
-            self.z_r = wp.zeros(1, dtype=wp.float32)
-            
+            if self.v_A_v is None:
+                self.v_A_v = wp.zeros(1, dtype=wp.float32)
+                self.z_r_last = wp.zeros(1, dtype=wp.float32)
+                self.z_r = wp.zeros(1, dtype=wp.float32)
+        self._cap_particles = MP
+        self.graph = None
+
     def clear(self):
         self.graph = None
 
@@ -106,6 +124,8 @@ class CGSolver:
         s = self.system
         c = s.config
         NP = s.n_particles
+
+        self.ensure_capacity()
         
         if c.debug and not c.use_cuda_graph:
             hess_diag_np = s.hess_diag.numpy()
@@ -171,5 +191,3 @@ class CGSolver:
                 logger.debug(
                     f"CG error from {z_r_start:.3e} to {z_r_end:.3e}, ratio: {ratio:.3e}"
                 )
-
-            

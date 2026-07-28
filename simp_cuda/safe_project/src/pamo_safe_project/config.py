@@ -8,11 +8,19 @@ class Stage3Config:
         self.debug = False  # enable debug mode, may slow down the simulation
         self.seed = 0  # random seed for trimesh sampling
         
-        # Memory parameters
+        # Memory parameters — hard ceilings (allocations are mesh-sized by default)
         self.max_particles = 1 << 20
         self.max_blocks = 1 << 25
         self.max_gt_particles = 1 << 24
         self.max_gt_samples = 1 << 14
+
+        # Phase B P1-2: size buffers from the registered mesh and grow on overflow.
+        # When True (default), Stage3System does not eagerly reserve ~5 GiB at init.
+        # When False, allocate the full max_* ceilings up front (legacy behaviour).
+        self.auto_capacity = True
+        self.capacity_growth = 2.0  # geometric growth factor on overflow
+        self.min_blocks = 1 << 16  # floor for contact-pair buffer
+        self.blocks_per_edge = 16  # initial contact capacity heuristic vs n_edges
 
         # Solver parameters
         self.n_newton_iters = 10  # Number of Newton iterations per Step
