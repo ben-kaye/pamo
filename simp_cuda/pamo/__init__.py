@@ -92,11 +92,11 @@ class PaMO(nn.Module):
         
         return v, f
 
-    def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3, iter=1000000, min_verts=0):
-        # min_verts floors the *face* target (legacy misnomer). Default 0 so
-        # ratio alone controls the target; the old 1e10 default disabled
-        # simplification (HANDOFF2 §3.4).
-        self.target_faces = max(int(ratio * len(triangles)), min_verts)
+    def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3, iter=1000000, min_faces=0):
+        # min_faces is a floor on the *face* target (not vertex count).
+        # Default 0 so ratio alone controls the target; the old 1e10 default
+        # disabled simplification (HANDOFF2 §3.4).
+        self.target_faces = max(int(ratio * len(triangles)), min_faces)
         print("Target faces : {}".format(self.target_faces))
 
         # scale the input mesh

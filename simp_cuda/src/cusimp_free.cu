@@ -4,6 +4,8 @@
 #include "thrust/fill.h"
 #include <math.h>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #include "bvh/self_intersect.cuh"
 #include <fstream>
 #include <thrust/shuffle.h>
@@ -14,17 +16,19 @@ namespace cusimp_free
     constexpr const int BLOCK_SIZE = 512;
     constexpr const float COST_RANGE = 10.0;
 
-    bool check_cuda_result(cudaError_t code, const char *file, int line)
+    void check_cuda_result(cudaError_t code, const char *file, int line)
     {
         if (code == cudaSuccess)
-            return true;
+            return;
 
         fprintf(stderr, "CUDA error %u: %s (%s:%d)\n", unsigned(code), cudaGetErrorString(code), file,
                 line);
-        return false;
+        throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(code) +
+                                 " at " + file + ":" + std::to_string(line));
     }
 
-#define CHECK_CUDA(code) check_cuda_result(code, __FILE__, __LINE__);
+#define CHECK_CUDA(code) check_cuda_result(code, __FILE__, __LINE__)
+#define CHECK_KERNEL() check_cuda_result(cudaGetLastError(), __FILE__, __LINE__)
 
     template <typename T>
     inline __device__ __host__ T min(T a, T b) { return a < b ? a : b; }
@@ -385,7 +389,11 @@ namespace cusimp_free
         int edge_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (edge_index >= sp.n_edges)
             return;
-        // printf("edge_index %d sp.n_edges %d\n", edge_index, sp.n_edges);
+
+        // Reject by default; only overwrite after every validity check passes.
+        // (Stale/uninitialized costs were a nondeterminism and crash source.)
+        const uint32_t COST_INVALID = std::numeric_limits<uint32_t>::max();
+        sp.edge_cost[edge_index] = COST_INVALID;
 
         Edge<int> edge = sp.edges[edge_index];
         Vertex<float> v0 = sp.points[edge.u];
@@ -394,14 +402,12 @@ namespace cusimp_free
         int idx_v1 = edge.v;
 
         if (sp.vertices_invalid_table[idx_v0] && sp.vertices_invalid_table[idx_v1])
-        {
-            sp.edge_cost[edge_index] = std::numeric_limits<uint32_t>::max();
-            //printf("max cost %d %d\n", idx_v0, idx_v1);
             return;
-        }
 
-        if (is_stuck)
-            return;
+        // is_stuck only affects which vertices are marked invalid (host path).
+        // Always recompute costs: edge indices are rebuilt each forward call, so
+        // reusing prior array slots would apply costs to the wrong edges.
+        (void)is_stuck;
 
         // check if the collapse is valid
         int dup_num = 0;
@@ -432,17 +438,11 @@ namespace cusimp_free
                 if (idx_u == idx_v)
                     dup_num++;
                 if (dup_num > 2)
-                {
-                    sp.edge_cost[edge_index] = std::numeric_limits<uint32_t>::max();
                     return;
-                }
             }
         }
         if (dup_num != 2)
-        {
             return;
-            printf("dup_num %d\n", dup_num);
-        }
 
         // compute near edge length
         float edge_len = 0;
@@ -483,6 +483,8 @@ namespace cusimp_free
                 num_edge++;
             }
         }
+        if (num_edge <= 0 || !(sp.edge_s > 0.0f))
+            return;
         edge_len = edge_len / num_edge / sp.edge_s * sp.tres;
         // printf("edge_len %f\n", edge_len);
 
@@ -525,10 +527,7 @@ namespace cusimp_free
 
             // if the normal is flipped, invalid collapse
             if (old_normal.dot(new_normal) < 0)
-            {
-                sp.edge_cost[edge_index] = std::numeric_limits<uint32_t>::max();
                 return;
-            }
 
             // compute the area of the new triangle
             Q_a += 1.0f - clamp(float(4.0f * sqrt(3.0f) * triangle_area(new_v0, new_v1, new_v2) / pow(edge_length(new_v0, new_v1), 2) + pow(edge_length(new_v1, new_v2), 2) + pow(edge_length(new_v2, new_v0), 2) + 0.0000001f), 0.0f, 1.0f);
@@ -565,10 +564,7 @@ namespace cusimp_free
 
             // if the normal is flipped, invalid collapse
             if (old_normal.dot(new_normal) < 0)
-            {
-                sp.edge_cost[edge_index] = std::numeric_limits<uint32_t>::max();
                 return;
-            }
 
             // compute the area of the new triangle
             Q_a += 1.0f - clamp(float(4.0f * sqrt(3.0f) * triangle_area(new_v0, new_v1, new_v2) / pow(edge_length(new_v0, new_v1), 2) + pow(edge_length(new_v1, new_v2), 2) + pow(edge_length(new_v2, new_v0), 2) + 0.0000001f), 0.0f, 1.0f);
@@ -579,10 +575,16 @@ namespace cusimp_free
         const float SKINNY_TRIANGLE_PENALTY = 5.0f;
         Q_a = SKINNY_TRIANGLE_PENALTY * Q_a;
 
+        if (num_tri <= 0)
+            return;
+
         Mat4x4<float> Q = sp.vert_Q[edge.u] + sp.vert_Q[edge.v];
         Vec4<float> v4 = {v.x, v.y, v.z, 1};
         float cost = Q.vTMv(v4) / (sp.edge_s * sp.edge_s);
-        sp.edge_cost[edge_index] = uint32_t(clamp(cost + edge_len + Q_a / num_tri * sp.tres, 0.0f, COST_RANGE) / COST_RANGE * std::numeric_limits<uint32_t>::max());
+        float total = cost + edge_len + Q_a / float(num_tri) * sp.tres;
+        if (!(total == total)) // NaN
+            return;
+        sp.edge_cost[edge_index] = uint32_t(clamp(total, 0.0f, COST_RANGE) / COST_RANGE * std::numeric_limits<uint32_t>::max());
     }
 
     __global__ void propagate_edge_cost_kernel(CUSimp_Free sp)
@@ -782,7 +784,11 @@ namespace cusimp_free
 
         int collapsed_edge_idx = sp.collapsed_edge_idx[collapsed_edge_index];
         Edge<int> edge = sp.edges[collapsed_edge_idx];
+        // n_intersect is a stored count of triangle indices (not pairs).
+        // Capacity is 2 * (allocated_tris + 1); never read past it.
         int num_intersect = *sp.n_intersect;
+        if (num_intersect < 0)
+            num_intersect = 0;
         int first = sp.first_near_tris[edge.u];
         int last = sp.first_near_tris[edge.u + 1];
         bool flag = false;
@@ -983,7 +989,13 @@ namespace cusimp_free
         compute_vert_Q_kernel<<<(n_pts + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
         ensure_edge_cost_storage_size(n_edges);
-        compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, is_stuck);
+        // Initialize all costs to invalid before the kernel (defensive against
+        // partial writes / future early-exit paths). Kernel also assigns first.
+        CHECK_CUDA(cudaMemset(edge_cost, 0xFF, (size_t)n_edges * sizeof(uint32_t)));
+        if (n_edges > 0) {
+            compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, is_stuck);
+            CHECK_KERNEL();
+        }
         CHECK_CUDA(cudaMemcpy(original_edge_cost, edge_cost, n_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
 
         // cost propagate
@@ -1027,30 +1039,34 @@ namespace cusimp_free
             if (n_edges > 0) {
                 remove_line_edge_collapse<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
             }
-            // self intersection check after collapse
+            // self intersection check after collapse (throws on overflow / CUDA error)
             (void)selfx::self_intersect(this, n_pts, n_tris, epsilon);
             CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
             get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-            cudaDeviceSynchronize();
+            CHECK_KERNEL();
+            CHECK_CUDA(cudaDeviceSynchronize());
 
             // get number of edges undo
             int h_n_edges_undo = 0;
-            cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost);
+            CHECK_CUDA(cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost));
             n_vertices_undo += 2 * h_n_edges_undo;
             int i = 0;
             while (h_n_edges_undo != 0) {
                 i++;
                 undo_collapse_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+                CHECK_KERNEL();
                 rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
-                cudaDeviceSynchronize();
+                CHECK_KERNEL();
+                CHECK_CUDA(cudaDeviceSynchronize());
                 first_n_vertices_undo += 2 * h_n_edges_undo;
 
                 (void)selfx::self_intersect(this, n_pts, n_tris, epsilon);
-                cudaDeviceSynchronize();
+                CHECK_CUDA(cudaDeviceSynchronize());
                 CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
                 get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-                cudaDeviceSynchronize();
-                cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost);
+                CHECK_KERNEL();
+                CHECK_CUDA(cudaDeviceSynchronize());
+                CHECK_CUDA(cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost));
                 n_vertices_undo += 2 * h_n_edges_undo;
 
                 if (i == 5) break;

@@ -140,26 +140,36 @@ class CGSolver:
                 inputs=[self.z, self.r],
                 outputs=[self.z_r],
             )
-            z_r_start = self.z_r.numpy()[0]
-            
+            z_r_start = float(self.z_r.numpy()[0])
+
             if c.debug and not c.use_cuda_graph:
                 assert not np.isnan(self.r.numpy()).any(), "Initial residual is NaN"
                 assert not np.isnan(z_r_start), "Initial residual norm z_r is NaN"
+
+            # Already solved or non-finite residual: leave p = 0.
+            if not np.isfinite(z_r_start) or abs(z_r_start) < 1e-30:
+                if c.debug:
+                    logger.debug(
+                        f"CG early exit: initial z^T r = {z_r_start:.3e}"
+                    )
+                return
 
             # ------------------------- Main loop ------------------------- #
             if c.use_cuda_graph and self.graph is None:
                 wp.capture_begin()
                 self._launch_main_loop()
                 self.graph = wp.capture_end()
-            
+
             if c.use_cuda_graph:
                 wp.capture_launch(self.graph)
             else:
                 self._launch_main_loop()
-            
+
             if c.debug:
-                z_r_end = self.z_r.numpy()[0]
-                logger.debug(f"CG error from {z_r_start:.3e} to {z_r_end:.3e}, ratio: {z_r_end / z_r_start:.3e}")
-            
-            
+                z_r_end = float(self.z_r.numpy()[0])
+                ratio = z_r_end / z_r_start if abs(z_r_start) > 1e-30 else float("nan")
+                logger.debug(
+                    f"CG error from {z_r_start:.3e} to {z_r_end:.3e}, ratio: {ratio:.3e}"
+                )
+
             

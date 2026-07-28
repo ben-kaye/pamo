@@ -46,7 +46,7 @@ python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001
 
 - **`--input`**: Specify the path to the input mesh file. If not provided, it defaults to `./mesh/crab.obj`.
 - **`--ratio`**: Set the simplification ratio to control the target reduction in the number of triangles. For example, `--ratio 0.001` (default) means reducing the number of triangles to 0.1% of the original.
-- **`--min-vertex`**: Add this flag to constrain the minimum number of vertices after simplification, default=0.
+- **`--min-faces`**: Floor on the target face count after simplification (not vertices), default=0.
 - **`--disable_stage1`**: Add this flag to skip the remeshing process (stage 1), default=false.
 - **`--disable_stage3`**: Add this flag to skip the safe projection process (stage 3), default=false.
 
@@ -63,7 +63,7 @@ pamo = PaMO(input_mesh, use_stage1=True, use_stage3=True)
 ### Run
 Performs mesh optimization to reduce the complexity of the mesh while preserving essential details according to specified parameters.
 ```
-pamo.run(points, triangles, ratio, tolerance=4, threshold=1e-3, iter=100000)
+pamo.run(points, triangles, ratio, tolerance=4, threshold=1e-3, iter=100000, min_faces=0)
 ```
 
 #### Parameters
@@ -72,6 +72,8 @@ pamo.run(points, triangles, ratio, tolerance=4, threshold=1e-3, iter=100000)
 **triangles** (`int Tensor`): Faces of the mesh. A tensor of integers where each row represents a triangle in the mesh defined by indices into the points array.
 
 **ratio** (`float`): Decimation ratio specifying the target reduction in the number of triangles.
+
+**min_faces** (`int`, *default = 0*): Floor on the target face count (`target_faces = max(ratio * n_faces, min_faces)`). Not a vertex limit.
 
 **use_stage1** (`bool`, *default = True*): Whether to use a remeshing (stage 1) before simplification.
 

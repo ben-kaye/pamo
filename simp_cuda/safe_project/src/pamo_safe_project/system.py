@@ -8,7 +8,7 @@ import logging
 from .config import Stage3Config
 from .energy import *
 from .cg_solver import CGSolver
-from .kernels.solver_kernels import line_search_kernel, clamp_p_kernel
+from .kernels.solver_kernels import line_search_kernel, clamp_p_kernel, restore_q_kernel
 from .utils import stage3_logger as logger
 from .utils import wp_slice
 from .metrics import compute_igl_CD_HD
@@ -408,6 +408,28 @@ class Stage3System:
             )
             self._compute_energy()
 
+    def _reject_line_search_if_needed(self):
+        """Restore q_prev_newton if no candidate decreased a finite objective.
+
+        Must run on the host after the (possibly graph-captured) line search.
+        AUDIT P0-5: without this, the final half-step remains even when it
+        increased energy.
+        """
+        e = float(self.energy.numpy()[0])
+        e_prev = float(self.energy_prev.numpy()[0])
+        if not (e == e) or not (e_prev == e_prev) or not (e < e_prev):
+            wp.launch(
+                kernel=restore_q_kernel,
+                dim=self.n_particles,
+                inputs=[self.q_prev_newton],
+                outputs=[self.q],
+            )
+            wp.copy(self.energy, self.energy_prev, count=1)
+            if self.config.debug:
+                logger.warning(
+                    f"Line search rejected: energy {e:.3e} vs prev {e_prev:.3e}; restored q"
+                )
+
     def step(
         self,
         eval=False,
@@ -454,6 +476,8 @@ class Stage3System:
                 wp.capture_launch(self.line_search_graph)
             else:
                 self._line_search()
+            # Outside the CUDA graph: reject non-improving / non-finite steps.
+            self._reject_line_search_if_needed()
 
             if c.debug:
                 self._compute_energy(verbose=True)

@@ -3,6 +3,10 @@
 #include <vector>
 #include <iostream>
 #include <cmath>
+#include <stdexcept>
+#include <string>
+#include <thrust/reduce.h>
+#include <thrust/functional.h>
 #include "bvh.cuh"
 #include "query.cuh"
 #include "types.cuh"
@@ -12,6 +16,8 @@
 
 // Max AABB-overlap candidates per face. Each candidate packs as 2 uints
 // (query_idx, other_idx), so per-face worst-case write is 2 * BUFFER_SIZE.
+// Hitting this cap is treated as a hard failure (AUDIT P0-3) rather than a
+// silent guarantee reduction. Two-pass uncapped packing is deferred.
 #define BUFFER_SIZE 512
 
 using namespace std;
@@ -22,6 +28,17 @@ namespace cusimp_free {
 
 namespace selfx{
     const int BLOCK_SIZE = 512;
+
+    // Host-side helper: throw on CUDA API failure (matches stage-2 policy).
+    inline void check_cuda(cudaError_t code, const char *file, int line)
+    {
+        if (code == cudaSuccess)
+            return;
+        fprintf(stderr, "CUDA error %u: %s (%s:%d)\n", unsigned(code),
+                cudaGetErrorString(code), file, line);
+        throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(code));
+    }
+#define SELF_X_CHECK(code) selfx::check_cuda((code), __FILE__, __LINE__)
 
     __device__ __host__
     inline bool are_vertices_same(const float3 v1, const float3 v2, float epsilon){
@@ -204,15 +221,32 @@ namespace selfx{
         // get number of intersection candidates (slot counts per face)
         compute_num_of_query_result_kernel<<<n_blocks, BLOCK_SIZE>>>(
             F_d_raw, bvh_dev, num_found_results_raw, num_faces);
-        cudaDeviceSynchronize();
+        SELF_X_CHECK(cudaGetLastError());
+        SELF_X_CHECK(cudaDeviceSynchronize());
         thrust::exclusive_scan(thrust::device, num_found_results_raw,
                                num_found_results_raw + num_faces + 1,
                                sp->first_query_result.data());
 
         // total packed slots (= 2 * total candidate pairs)
         unsigned int total_slots = 0;
-        cudaMemcpy(&total_slots, first_query_result_raw + num_faces,
-                   sizeof(unsigned int), cudaMemcpyDeviceToHost);
+        SELF_X_CHECK(cudaMemcpy(&total_slots, first_query_result_raw + num_faces,
+                                sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+        // Detect per-face candidate cap hits (num_found_query stores 2 * count).
+        // A face that saturates BUFFER_SIZE may have missed real candidates.
+        {
+            thrust::device_ptr<unsigned int> num_found_ptr(num_found_results_raw);
+            unsigned int max_slots = thrust::reduce(
+                thrust::device, num_found_ptr, num_found_ptr + num_faces, 0u,
+                thrust::maximum<unsigned int>());
+            if (max_slots >= 2u * (unsigned int)BUFFER_SIZE) {
+                throw std::runtime_error(
+                    "self_intersect: per-face AABB candidate cap (" +
+                    std::to_string(BUFFER_SIZE) +
+                    ") hit; intersection guarantee cannot be maintained. "
+                    "Retry with a coarser mesh or raise BUFFER_SIZE.");
+            }
+        }
 
         // Grow candidate buffer if exclusive_scan total exceeds capacity
         // (should not with per-face cap, but keep safe for future cap changes).
@@ -228,25 +262,32 @@ namespace selfx{
         // save data of intersection candidates
         compute_query_list_kernel<<<n_blocks, BLOCK_SIZE>>>(
             F_d_raw, bvh_dev, first_query_result_raw, intersect_candidates_raw, num_faces);
-        cudaDeviceSynchronize();
+        SELF_X_CHECK(cudaGetLastError());
+        SELF_X_CHECK(cudaDeviceSynchronize());
 
         // Actual tri-tri intersection test based on intersection candidates ----
         unsigned int h_isIntersect = 0;
-        unsigned int* d_isIntersect;
-        cudaMalloc((void**)&d_isIntersect, sizeof(unsigned int));
-        cudaMemcpy(d_isIntersect, &h_isIntersect, sizeof(unsigned int), cudaMemcpyHostToDevice);
+        unsigned int* d_isIntersect = nullptr;
+        SELF_X_CHECK(cudaMalloc((void**)&d_isIntersect, sizeof(unsigned int)));
+        SELF_X_CHECK(cudaMemcpy(d_isIntersect, &h_isIntersect, sizeof(unsigned int), cudaMemcpyHostToDevice));
 
-        // list of actual intersection pairs
-        const int maxIntersections = (int)num_faces;
-        unsigned int* d_intersections;
-        cudaMalloc((void**)&d_intersections, 2ull * (size_t)maxIntersections * sizeof(unsigned int));
-        if (maxIntersections > 0) {
-            cudaMemset(d_intersections + 2 * maxIntersections - 2, 0, sizeof(unsigned int));
+        // Result buffer: capacity is face-proportional. Record total vs stored
+        // separately so consumers never OOB-read past capacity (AUDIT P0-2).
+        const unsigned int capacity_ints = 2u * (unsigned int)num_faces;
+        unsigned int* d_intersections = nullptr;
+        if (capacity_ints > 0) {
+            SELF_X_CHECK(cudaMalloc((void**)&d_intersections,
+                                    (size_t)capacity_ints * sizeof(unsigned int)));
+            SELF_X_CHECK(cudaMemset(d_intersections, 0xFF,
+                                    (size_t)capacity_ints * sizeof(unsigned int)));
         }
 
-        unsigned int* d_pos;
-        cudaMalloc(&d_pos, sizeof(unsigned int));
-        cudaMemset(d_pos, 0, sizeof(unsigned int));
+        unsigned int* d_total = nullptr;   // raw atomic counter (may exceed capacity)
+        unsigned int* d_stored = nullptr;  // number of ints actually written
+        SELF_X_CHECK(cudaMalloc(&d_total, sizeof(unsigned int)));
+        SELF_X_CHECK(cudaMalloc(&d_stored, sizeof(unsigned int)));
+        SELF_X_CHECK(cudaMemset(d_total, 0, sizeof(unsigned int)));
+        SELF_X_CHECK(cudaMemset(d_stored, 0, sizeof(unsigned int)));
 
         // actual number of candidate pairs (each pair is 2 slots)
         unsigned int num_query_result = total_slots / 2u;
@@ -254,7 +295,7 @@ namespace selfx{
         thrust::for_each(thrust::device,
                          thrust::make_counting_iterator<unsigned int>(0),
                          thrust::make_counting_iterator<unsigned int>(num_query_result),
-                         [near_tris_raw, pts_occ_raw, epsilon, d_isIntersect, d_pos, d_intersections, maxIntersections, first_query_result_raw, triangles_d_raw, num_found_results_raw, intersect_candidates_raw, F_d_raw] __device__(std::size_t idx) {
+                         [epsilon, d_isIntersect, d_total, d_stored, d_intersections, capacity_ints, triangles_d_raw, intersect_candidates_raw, F_d_raw] __device__(std::size_t idx) {
                                 unsigned int query_idx = intersect_candidates_raw[2 * idx];
                                 unsigned int current_idx = intersect_candidates_raw[2 * idx + 1];
 
@@ -304,116 +345,87 @@ namespace selfx{
                                 copy_v3_v3_float_float3(tri_b[1], q2);
                                 copy_v3_v3_float_float3(tri_b[2], r2);
 
-                                
-
                                 // check if coplanar
                                 if(is_coplanar(tri_a, tri_b)){
-                                    return;
-                                    if(num_count == 0){
-                                        if(coplanar_without_sharing_test(p1,q1,r1,p2,q2,r2)){
-                                            atomicExch(d_isIntersect, 1);
-                                            int pos = atomicAdd(d_pos, 2);
-                                            if (pos < 2 * maxIntersections - 2) {
-                                                d_intersections[pos] = query_idx;
-                                                d_intersections[pos + 1] = current_idx;
-                                            }
-                                        }
-                                        return;
-                                    }
-
-                                    // vertex sharing
-                                    if(num_count == 1){
-                                        if(coplanar_vertex_sharing_test(p1,q1,r1,p2,q2,r2,epsilon)){
-                                            atomicExch(d_isIntersect, 1);
-                                            int pos = atomicAdd(d_pos, 2);
-                                            if (pos < 2 * maxIntersections - 2) {
-                                                d_intersections[pos] = query_idx;
-                                                d_intersections[pos + 1] = current_idx;
-                                            }
-                                        }
-                                        return;
-                                    }
-                                    // edge sharing
-                                    if(num_count == 2){
-                                        if(coplanar_same_side_test(p1,q1,r1,p2,q2,r2,epsilon)){
-                                            atomicExch(d_isIntersect, 1);
-                                            int pos = atomicAdd(d_pos, 2);
-                                            if (pos < 2 * maxIntersections - 2) {
-                                                d_intersections[pos] = query_idx;
-                                                d_intersections[pos + 1] = current_idx;
-                                            }
-                                        }
-                                        return;
-                                    }
-                                    // identical face
-                                    if(num_count == 3){
-                                        atomicExch(d_isIntersect, 1);
-                                        // check where is intersection -------------------
-                                        int pos = atomicAdd(d_pos, 2);
-                                        if (pos < 2 * maxIntersections - 2) {
-                                            d_intersections[pos] = query_idx;
-                                            d_intersections[pos + 1] = current_idx;
-                                        }
-                                        return;
-                                    }
+                                    // Coplanar tests were previously dead code
+                                    // (unconditional return). Keep non-coplanar
+                                    // path as the active guarantee for now.
                                     return;
                                 }
-                                else{
-                                    // no coplanar, shared edge
-                                    if(num_count == 2){
-                                        return; // remove from the test
-                                    }
-                                    else if(detect_shared_edge_coord(p1,q1,r1,p2,q2,r2)){ // remove from the test
-                                        return;
-                                    }
 
-                                    float3 source, target;
-
-                                    source = make_float3(1,1,1);
-                                    target = make_float3(-1,-1,-1);
-
-                                    float r_i1[3];
-                                    float r_i2[3];
-                                    // actual intersection test
-                                    bool isIntersecting = isect_tri_tri_v3(p1,q1,r1,p2,q2,r2,r_i1,r_i2);
-                                    
-                                    if(isIntersecting){
-                                        copy_v3_v3_float3_float(source, r_i1);
-                                        copy_v3_v3_float3_float(target, r_i2);
-                                        float dist = largest_distance(source, target);
-                                        bool sharedVertex = (num_count == 1);
-                                        // if the distance is less than eps with shared vertex, the intersection point would be shared vertex
-                                        if(dist < epsilon && sharedVertex){
-                                            return; // not self intersect
-                                        }
-                                        else{
-                                            atomicExch(d_isIntersect, 1);
-                                            int pos = atomicAdd(d_pos, 2);
-                                            if (pos < 2 * maxIntersections - 2) {
-                                                d_intersections[pos] = query_idx;
-                                                d_intersections[pos + 1] = current_idx;
-                                            }
-                                        }
-                                    }
-                                    return;             
-
+                                // no coplanar, shared edge
+                                if(num_count == 2){
+                                    return; // remove from the test
+                                }
+                                else if(detect_shared_edge_coord(p1,q1,r1,p2,q2,r2)){ // remove from the test
+                                    return;
                                 }
 
-                            return;
+                                float3 source, target;
+
+                                source = make_float3(1,1,1);
+                                target = make_float3(-1,-1,-1);
+
+                                float r_i1[3];
+                                float r_i2[3];
+                                // actual intersection test
+                                bool isIntersecting = isect_tri_tri_v3(p1,q1,r1,p2,q2,r2,r_i1,r_i2);
+
+                                if(isIntersecting){
+                                    copy_v3_v3_float3_float(source, r_i1);
+                                    copy_v3_v3_float3_float(target, r_i2);
+                                    float dist = largest_distance(source, target);
+                                    bool sharedVertex = (num_count == 1);
+                                    // if the distance is less than eps with shared vertex, the intersection point would be shared vertex
+                                    if(dist < epsilon && sharedVertex){
+                                        return; // not self intersect
+                                    }
+                                    atomicExch(d_isIntersect, 1u);
+                                    unsigned int pos = atomicAdd(d_total, 2u);
+                                    // Write only if both slots fit; still count
+                                    // total so host can detect overflow.
+                                    if (d_intersections != nullptr && pos + 1u < capacity_ints) {
+                                        d_intersections[pos] = query_idx;
+                                        d_intersections[pos + 1u] = current_idx;
+                                        atomicAdd(d_stored, 2u);
+                                    }
+                                }
                          });
+        SELF_X_CHECK(cudaDeviceSynchronize());
 
-        // copy result
-        cudaMemcpy(sp->intersected_triangle_idx, d_intersections, 2 * maxIntersections * sizeof(unsigned int), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(sp->n_intersect, d_pos, sizeof(unsigned int), cudaMemcpyDeviceToDevice);
+        unsigned int h_total = 0;
+        unsigned int h_stored = 0;
+        SELF_X_CHECK(cudaMemcpy(&h_total, d_total, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        SELF_X_CHECK(cudaMemcpy(&h_stored, d_stored, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
-        cudaFree(d_intersections);
-        cudaFree(d_pos);
+        // Copy only the stored ints into the persistent buffer; n_intersect is
+        // the stored count so get_undo_candidate never walks past capacity.
+        if (capacity_ints > 0 && h_stored > 0 && sp->intersected_triangle_idx != nullptr) {
+            unsigned int copy_n = h_stored < capacity_ints ? h_stored : capacity_ints;
+            SELF_X_CHECK(cudaMemcpy(sp->intersected_triangle_idx, d_intersections,
+                                    (size_t)copy_n * sizeof(unsigned int),
+                                    cudaMemcpyDeviceToDevice));
+        }
+        if (sp->n_intersect != nullptr) {
+            SELF_X_CHECK(cudaMemcpy(sp->n_intersect, &h_stored, sizeof(unsigned int),
+                                    cudaMemcpyHostToDevice));
+        }
 
-        cudaDeviceSynchronize();
-        cudaMemcpy(&h_isIntersect, d_isIntersect, sizeof(unsigned int), cudaMemcpyDeviceToHost);
-        cudaFree(d_isIntersect);
+        if (d_intersections) SELF_X_CHECK(cudaFree(d_intersections));
+        SELF_X_CHECK(cudaFree(d_total));
+        SELF_X_CHECK(cudaFree(d_stored));
 
-        return h_isIntersect;
+        SELF_X_CHECK(cudaMemcpy(&h_isIntersect, d_isIntersect, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        SELF_X_CHECK(cudaFree(d_isIntersect));
+
+        if (h_total > capacity_ints) {
+            throw std::runtime_error(
+                "self_intersect: intersection result buffer overflow (total=" +
+                std::to_string(h_total) + ", capacity=" + std::to_string(capacity_ints) +
+                "). Consumers would have read out of bounds; aborting.");
+        }
+
+        return h_isIntersect != 0;
     }
 
 }

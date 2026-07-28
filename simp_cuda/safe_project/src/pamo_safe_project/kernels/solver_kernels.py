@@ -15,11 +15,17 @@ def update_p_r_z_compute_zr_kernel(
 ):
     tid = wp.tid()
 
-    if v_A_v[0] > 1e-16:
-        alpha = zr[0] / v_A_v[0]
+    # Guard breakdown: skip state update when p^T A p is non-positive or
+    # residual inner product is non-finite / already solved.
+    pap = v_A_v[0]
+    zr0 = zr[0]
+    if pap > 1e-16 and wp.abs(zr0) > 1e-30:
+        alpha = zr0 / pap
         p[tid] = p[tid] + alpha * v[tid]
         r[tid] = r[tid] - alpha * A_v[tid]
-    z[tid] = wp.cw_div(r[tid], diag[tid])
+    # Jacobi preconditioner with epsilon already applied elsewhere; still
+    # protect against exact-zero diagonal components.
+    z[tid] = wp.cw_div(r[tid], diag[tid] + wp.vec3(1e-6))
     wp.atomic_add(zr_new, 0, wp.dot(z[tid], r[tid]))
 
 
@@ -32,8 +38,15 @@ def update_v_kernel(
 ):
     tid = wp.tid()
 
-    s = zr_new[0] / zr[0]
-    v[tid] = z[tid] + s * v[tid]
+    # Guard zr_new/zr: zero residual, underflow, or NaN must not produce Inf/NaN.
+    zr0 = zr[0]
+    zr1 = zr_new[0]
+    if wp.abs(zr0) > 1e-30 and zr0 == zr0 and zr1 == zr1:
+        s = zr1 / zr0
+        v[tid] = z[tid] + s * v[tid]
+    else:
+        # Breakdown or converged: restart search direction as preconditioned residual.
+        v[tid] = z[tid]
 
 
 @wp.kernel
@@ -69,9 +82,21 @@ def line_search_kernel(
     q_new: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
-    if n_halves > 0.0 and energy[0] < energy_prev[0]:
+    # Keep an accepted (strictly decreasing, finite) candidate.
+    e = energy[0]
+    e_prev = energy_prev[0]
+    if n_halves > 0.0 and e == e and e < e_prev:
         return
     q_new[tid] = q[tid] + alpha[0] * wp.pow(0.5, n_halves) * p[tid]
+
+
+@wp.kernel
+def restore_q_kernel(
+    q_prev: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    q[tid] = q_prev[tid]
 
 
 @wp.kernel

@@ -3,6 +3,8 @@
 #include "thrust/sort.h"
 #include "thrust/fill.h"
 #include <math.h>
+#include <stdexcept>
+#include <string>
 #include <thrust/shuffle.h>
 #include <thrust/random.h>
 
@@ -11,17 +13,19 @@ namespace cusimp
     const int BLOCK_SIZE = 512;
     const float COST_RANGE = 10.0;
 
-    bool check_cuda_result(cudaError_t code, const char *file, int line)
+    void check_cuda_result(cudaError_t code, const char *file, int line)
     {
         if (code == cudaSuccess)
-            return true;
+            return;
 
         fprintf(stderr, "CUDA error %u: %s (%s:%d)\n", unsigned(code), cudaGetErrorString(code), file,
                 line);
-        return false;
+        throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(code) +
+                                 " at " + file + ":" + std::to_string(line));
     }
 
-#define CHECK_CUDA(code) check_cuda_result(code, __FILE__, __LINE__);
+#define CHECK_CUDA(code) check_cuda_result(code, __FILE__, __LINE__)
+#define CHECK_KERNEL() check_cuda_result(cudaGetLastError(), __FILE__, __LINE__)
 
     template <typename T>
     inline __device__ __host__ T min(T a, T b) { return a < b ? a : b; }
@@ -285,7 +289,10 @@ namespace cusimp
         int edge_index = blockIdx.x * blockDim.x + threadIdx.x;
         if (edge_index >= sp.n_edges)
             return;
-        // printf("edge_index %d sp.n_edges %d\n", edge_index, sp.n_edges);
+
+        // Reject by default; only overwrite after every validity check passes.
+        const uint32_t COST_INVALID = std::numeric_limits<uint32_t>::max();
+        sp.edge_cost[edge_index] = COST_INVALID;
 
         Edge<int> edge = sp.edges[edge_index];
         Vertex<float> v0 = sp.points[edge.u];
@@ -320,17 +327,11 @@ namespace cusimp
                 if (idx_u == idx_v)
                     dup_num++;
                 if (dup_num > 2)
-                {
-                    sp.edge_cost[edge_index] = std::numeric_limits<uint32_t>::max();
                     return;
-                }
             }
         }
         if (dup_num != 2)
-        {
             return;
-            printf("dup_num %d\n", dup_num);
-        }
 
         // compute near edge length
         float edge_len = 0;
@@ -371,6 +372,8 @@ namespace cusimp
                 num_edge++;
             }
         }
+        if (num_edge <= 0 || !(sp.edge_s > 0.0f))
+            return;
         edge_len = edge_len / num_edge / sp.edge_s * sp.tres;
         // printf("edge_len %f\n", edge_len);
 
@@ -414,10 +417,7 @@ namespace cusimp
 
             // if the normal is flipped, invalid collapse
             if (old_normal.dot(new_normal) < 0)
-            {
-                sp.edge_cost[edge_index] = std::numeric_limits<uint32_t>::max();
                 return;
-            }
 
             // compute the area of the new triangle
             Q_a += 1.0f - clamp(float(4.0f * sqrt(3) * triangle_area(new_v0, new_v1, new_v2) / pow(edge_length(new_v0, new_v1), 2) + pow(edge_length(new_v1, new_v2), 2) + pow(edge_length(new_v2, new_v0), 2) + 0.0000001f), 0.0f, 1.0f);
@@ -454,20 +454,23 @@ namespace cusimp
 
             // if the normal is flipped, invalid collapse
             if (old_normal.dot(new_normal) < 0)
-            {
-                sp.edge_cost[edge_index] = std::numeric_limits<uint32_t>::max();
                 return;
-            }
 
             // compute the area of the new triangle
             Q_a += 1.0f - clamp(float(4.0f * sqrt(3) * triangle_area(new_v0, new_v1, new_v2) / pow(edge_length(new_v0, new_v1), 2) + pow(edge_length(new_v1, new_v2), 2) + pow(edge_length(new_v2, new_v0), 2) + 0.0000001f), 0.0f, 1.0f);
             num_tri++;
         }
 
+        if (num_tri <= 0 || !(sp.edge_s > 0.0f))
+            return;
+
         Mat4x4<float> Q = sp.vert_Q[edge.u] + sp.vert_Q[edge.v];
         Vec4<float> v4 = {v.x, v.y, v.z, 1};
         float cost = Q.vTMv(v4) / (sp.edge_s * sp.edge_s);
-        sp.edge_cost[edge_index] = uint32_t(clamp(cost + edge_len + Q_a / num_tri * sp.tres, 0.0f, COST_RANGE) / COST_RANGE * std::numeric_limits<uint32_t>::max());
+        float total = cost + edge_len + Q_a / float(num_tri) * sp.tres;
+        if (!(total == total))
+            return;
+        sp.edge_cost[edge_index] = uint32_t(clamp(total, 0.0f, COST_RANGE) / COST_RANGE * std::numeric_limits<uint32_t>::max());
         // if (edge.v == 2644)
         // {
         //     // Q = sp.vert_Q[edge.v];
@@ -683,7 +686,11 @@ namespace cusimp
         //     printf("%d - vert_cost_host: %f\n", i, vert_cost_host[i]);
 
         ensure_edge_cost_storage_size(n_edges);
-        compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+        CHECK_CUDA(cudaMemset(edge_cost, 0xFF, (size_t)n_edges * sizeof(uint32_t)));
+        if (n_edges > 0) {
+            compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+            CHECK_KERNEL();
+        }
 
         // // Test edge_cost
         // uint32_t *edge_cost_host;
