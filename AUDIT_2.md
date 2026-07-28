@@ -1,0 +1,31 @@
+## Findings
+
+- **[P0] CUDA tensors are copied using the wrong transfer direction.** [`cusimp_free.cu:936`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp_free.cu:936) and [`cusimp.cu:600`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp.cu:600) receive device pointers from PyTorch but call `cudaMemcpyHostToDevice`. This can immediately fail or produce undefined behavior. Both copies must be device-to-device or stream-aware CUDA copies.
+
+- **[P0] The invalid-vertex table is read uninitialized and later retains stale flags.** Allocation at [`cusimp_free.cu:85`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp_free.cu:85) does not zero the table, while every edge reads it at [`cusimp_free.cu:404`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp_free.cu:404). The conditional clear at [`cusimp_free.cu:913`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp_free.cu:913) skips both the initial empty-undo call and later empty-undo iterations. Reallocation also happens after the attempted clear. Edge eligibility therefore depends on allocator contents and previous runs.
+
+- **[P0] `collapsed_edge_idx` can overflow.** It is allocated for exactly `n_edges` entries at [`cusimp_free.cu:1014`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp_free.cu:1014). The normal collapse kernel records entries, then `remove_line_edge_collapse` independently increments the same counter at [`cusimp_free.cu:250`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp_free.cu:250). An edge can be counted by both paths—for example, a collapse whose midpoint is zero—allowing up to roughly `2*n_edges` writes.
+
+- **[P1] Accumulated undo vertices can exceed their point-sized output buffer.** `vertices_undo_list` is allocated from point capacity at [`cusimp_free.cu:73`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp_free.cu:73), but stuck iterations retain the previous undo list and append two vertices for every newly undone edge at [`cusimp_free.cu:1052`](/Users/ben/Documents/pamo/simp_cuda/src/cusimp_free.cu:1052). There is no capacity check before the append or before exposing `n_vertices_undo` to `torch::from_blob`.
+
+- **[P1] The self-intersection check deliberately ignores coplanar intersections.** [`self_intersect.cuh:349`](/Users/ben/Documents/pamo/simp_cuda/src/bvh/self_intersect.cuh:349) returns immediately for every coplanar candidate. Overlapping coplanar triangles therefore pass the “safe” collapse check.
+
+- **[P1] BVH traversal can silently omit candidates.** Both traversals stop when the fixed 256-entry local stack fills at [`query.cuh:31`](/Users/ben/Documents/pamo/simp_cuda/src/bvh/query.cuh:31), without reporting truncation. The later candidate-cap check cannot detect this because it only sees the already-truncated count.
+
+- **[P1] Stage-one resolution changes without recomputing its normalization band.** `band` and `margin` are calculated once for `R=256` at [`pamo/__init__.py:51`](/Users/ben/Documents/pamo/simp_cuda/pamo/__init__.py:51), but `R` is changed to 128 or 64 at [`pamo/__init__.py:109`](/Users/ben/Documents/pamo/simp_cuda/pamo/__init__.py:109). Small-target runs consequently use the wrong voxel-width band. `R` is also never restored to 256 on later larger runs.
+
+- **[P1] A target already met still performs a collapse pass.** The target check occurs only after invoking the CUDA simplifier at [`pamo/__init__.py:133`](/Users/ben/Documents/pamo/simp_cuda/pamo/__init__.py:133). Ratios of `1.0` or greater can therefore alter and reduce a mesh that should require no simplification.
+
+- **[P1] Stage-three capacity growth can erase the registered edge list.** Hinge preprocessing may grow edge capacity after mesh data and BVHs have already been populated at [`energy.py:699`](/Users/ben/Documents/pamo/simp_cuda/safe_project/src/pamo_safe_project/energy.py:699). Growth replaces `self.edges`, `edge_lowers`, and `edge_uppers` with zero arrays at [`system.py:207`](/Users/ben/Documents/pamo/simp_cuda/safe_project/src/pamo_safe_project/system.py:207), but never recopies the original edges. This affects sufficiently non-manifold meshes where hinge count exceeds the initial edge capacity.
+
+- **[P2] Device handling is hard-coded to CUDA device 0.** Inputs can pass native validation on another GPU, while preprocessing, remeshing, undo buffers, DMC, and stage three explicitly use the default device or `cuda:0`, such as [`pamo/__init__.py:104`](/Users/ben/Documents/pamo/simp_cuda/pamo/__init__.py:104). There is also no PyTorch CUDA stream/device guard around raw allocations and kernel launches.
+
+- **[P2] Disabling stage one does not disable its dependencies or allocation.** [`pamo/__init__.py:48`](/Users/ben/Documents/pamo/simp_cuda/pamo/__init__.py:48) always constructs and moves DMC to CUDA. Consequently, `use_stage1=False` still requires PDMC, stage-one imports, a working GPU, and device memory.
+
+- **[P2] The shipped example calls a nonexistent argument.** [`example.py:34`](/Users/ben/Documents/pamo/example.py:34) passes `min_verts`, while `PaMO.run` accepts `min_faces`. The documented example terminates with `TypeError` before processing.
+
+- **[P2] CUDA compilation incorrectly depends on a visible runtime GPU.** [`simp_cuda/setup.py:27`](/Users/ben/Documents/pamo/simp_cuda/setup.py:27) selects `CUDAExtension` only when `torch.cuda.is_available()` is true, even if a CUDA toolkit is installed. On GPU-less build nodes it omits the `.cu` implementations and attempts an unusable C++-only extension.
+
+- **[P2] Hinge energy is discontinuous across the `atan2` branch cut.** [`hinge_energy.py:181`](/Users/ben/Documents/pamo/simp_cuda/safe_project/src/pamo_safe_project/kernels/energy_kernels/hinge_energy.py:181) subtracts angles directly without wrapping the difference to `[-π, π]`. Crossing from just below `π` to just above `-π` appears as an approximately `2π` bend.
+
+No files were changed. Python static compilation passed, but GPU tests could not be executed because this workspace has no `.venv` or installed Torch/Warp/CUDA Python dependencies.

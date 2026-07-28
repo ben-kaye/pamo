@@ -464,11 +464,11 @@ These should land before performance refactors.
 
 ### Phase B: Memory and asymptotic behavior
 
-1. Replace default maximum preallocation with mesh-sized growing buffers.
-2. Replace quadratic hinge discovery with edge adjacency.
-3. Replace capped BVH candidate packing with two-pass dynamic packing.
-4. Remove per-call temporary `cudaMalloc/cudaFree` from self-intersection checks.
-5. Make optional stages and calculators lazy.
+1. Replace default maximum preallocation with mesh-sized growing buffers. **Done (HANDOFF6):** `auto_capacity=True` default; `Stage3System.ensure_capacity` + per-calculator `ensure_capacity`; contact buffer grows on overflow before radius shrink.
+2. Replace quadratic hinge discovery with edge adjacency. **Done (HANDOFF7):** `build_hinge_indices` O(F log F) half-edge table; `HingeEnergyCalculator` uses `n_hinges` for launch dims (P1-12 boundary contract).
+3. Replace capped BVH candidate packing with two-pass dynamic packing. **Done (HANDOFF8):** uncapped count/scan/fill; grow `intersect_candidates` to exclusive-scan total; remove `BUFFER_SIZE=512` hard-fail (soft `SELF_X_MAX_TOTAL_SLOTS` resource limit remains).
+4. Remove per-call temporary `cudaMalloc/cudaFree` from self-intersection checks. **Done (HANDOFF8):** pooled `si_*` scratch + grow-only collapse/undo buffers on `CUSimp_Free`.
+5. Make optional stages and calculators lazy. **Done (HANDOFF8):** `lazy_calculators=True`; PaMO defers DMC + Stage3System to first use.
 
 ### Phase C: Architecture cleanup
 
