@@ -658,9 +658,16 @@ class HingeEnergyCalculator(EnergyCalculator):
         self.n_hinges = 0
         self.ensure_capacity()
 
-    def ensure_capacity(self):
+    def ensure_capacity(self, min_hinges: int = 0):
+        """Size hinge workspaces.
+
+        Hinge count can exceed unique mesh edges on non-manifold meshes.
+        Grow *only* this calculator's buffers — never mesh ``s.edges`` /
+        edge-BVH storage (those are collision topology and are uploaded
+        before preprocess).
+        """
         s = self.system
-        ME = max(int(s.cap_edges), 0)
+        ME = max(int(s.cap_edges), int(min_hinges), 0)
         if ME <= 0:
             with wp.ScopedDevice(s.device):
                 if self.rest_angles is None:
@@ -693,14 +700,13 @@ class HingeEnergyCalculator(EnergyCalculator):
         n_hinges = int(hinge_idx.shape[0])
         self.n_hinges = n_hinges
 
-        # Unique-edge capacity is the manifold upper bound; non-manifold opposite
-        # pairs can exceed it — grow before writing.
+        # Non-manifold opposite pairs can exceed unique-edge capacity. Grow
+        # hinge buffers only — do not reallocate s.edges / edge BVH.
         if n_hinges > self._cap_edges:
-            s.ensure_capacity(n_edges=max(int(s.n_edges), n_hinges))
-            self.ensure_capacity()
+            self.ensure_capacity(min_hinges=n_hinges)
         if n_hinges > self._cap_edges:
             raise RuntimeError(
-                f"Hinge count {n_hinges} exceeds edge capacity {self._cap_edges} "
+                f"Hinge count {n_hinges} exceeds hinge capacity {self._cap_edges} "
                 f"(n_edges={s.n_edges}, n_faces={s.n_triangles})"
             )
 

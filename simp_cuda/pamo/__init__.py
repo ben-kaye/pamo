@@ -1,5 +1,6 @@
 import os
 import copy
+import warnings
 import torch
 from torch import nn
 from torch.autograd import Function
@@ -16,7 +17,7 @@ import torchcumesh2sdf
 
 
 class PaMO(nn.Module):
-    def __init__(self, input_mesh, use_stage1 = True, use_stage3 = True):
+    def __init__(self, input_mesh, use_stage1=True, use_stage3=True):
         super().__init__()
         pamo = _C.CUDSP_Free()
 
@@ -25,32 +26,50 @@ class PaMO(nn.Module):
 
         print("Stage1 : ", self.use_stage1)
         print("Stage3 : ", self.use_stage3)
-        
+
         self.bbox = input_mesh.bounding_box.bounds
         diameter = np.abs(self.bbox[1] - self.bbox[0]).max()
         scale = 1.0 / diameter
         self.gt_mesh = copy.deepcopy(input_mesh)
-        
-        if self.use_stage3:
-            self.config = pamo_safe_project.config.Stage3Config()  # default config
-            self.system = pamo_safe_project.system.Stage3System(self.config)  # create a system (with all the cuda arrays)
+
+        # Phase B #5: stage 3 system + stage 1 DMC are built on first use.
+        self.config = None
+        self.system = None
+        self.vol2mesh = None
 
         class DSPFunction(Function):
             @staticmethod
             def forward(ctx, points, triangles, vertices_undo, num_vertices_undo, scale, threshold, is_stuck, init):
-                verts, faces, verts_occ, verts_map, verts_undo = pamo.forward(points, triangles, vertices_undo, num_vertices_undo, scale, threshold, is_stuck, init)
+                verts, faces, verts_occ, verts_map, verts_undo = pamo.forward(
+                    points, triangles, vertices_undo, num_vertices_undo,
+                    scale, threshold, is_stuck, init,
+                )
                 ctx.points = points
                 ctx.triangles = triangles
                 return verts, faces, verts_occ, verts_map, verts_undo
 
         self.func = DSPFunction
-        # vol2mesh params
-        self.vol2mesh = DMC(dtype=torch.float32).cuda()
         # mesh2vol params
         self.R = 256
-        self.band = 3 / self.R # 3
-        self.margin = self.band * 2 + 1 #2
+        self.band = 3 / self.R  # 3
+        self.margin = self.band * 2 + 1  # 2
         self.target_faces = None
+
+    def _ensure_stage1(self):
+        """Lazily construct Dual Marching Cubes when stage 1 is enabled."""
+        if not self.use_stage1:
+            return
+        if self.vol2mesh is None:
+            self.vol2mesh = DMC(dtype=torch.float32).cuda()
+
+    def _ensure_stage3(self):
+        """Lazily construct Stage3System when stage 3 is enabled."""
+        if not self.use_stage3:
+            return
+        if self.config is None:
+            self.config = pamo_safe_project.config.Stage3Config()
+        if self.system is None:
+            self.system = pamo_safe_project.system.Stage3System(self.config)
 
     def tri_area(self, v0, v1, v2):
         cross_prod = torch.cross(v1 - v0, v2 - v0)
@@ -92,10 +111,26 @@ class PaMO(nn.Module):
         
         return v, f
 
-    def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3, iter=1000000, min_faces=0):
+    def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3, iter=1000000,
+            min_faces=None, min_verts=None):
         # min_faces is a floor on the *face* target (not vertex count).
         # Default 0 so ratio alone controls the target; the old 1e10 default
         # disabled simplification (HANDOFF2 §3.4).
+        # min_verts is a deprecated alias for min_faces (pre-rename API).
+        if min_faces is not None and min_verts is not None:
+            raise TypeError(
+                "PaMO.run() got both min_faces and min_verts; "
+                "use min_faces only (min_verts is a deprecated alias)")
+        if min_verts is not None:
+            warnings.warn(
+                "PaMO.run(min_verts=...) is deprecated; use min_faces=... "
+                "(the value floors the face target, not vertex count)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            min_faces = min_verts
+        if min_faces is None:
+            min_faces = 0
         self.target_faces = max(int(ratio * len(triangles)), min_faces)
         print("Target faces : {}".format(self.target_faces))
 
@@ -103,8 +138,9 @@ class PaMO(nn.Module):
         tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(points, triangles, self.band, self.margin)
         tris = torch.tensor(tris, dtype=torch.float32, device='cuda:0')
 
-        # stage1 (Remeshing)
+        # stage1 (Remeshing) — Phase B #5: DMC constructed on first remesh
         if self.use_stage1:
+            self._ensure_stage1()
             # Default 256
             if self.target_faces <= 1000:
                 self.R = 128
@@ -164,8 +200,9 @@ class PaMO(nn.Module):
         faces = faces.cpu().numpy()
         print(f"Time for Simplification: {end_stage2 - start_stage2} sec")
         
-        # stage3 (Safe projection)
-        if self.use_stage3 == True:
+        # stage3 (Safe projection) — Phase B #5: system built on first projection
+        if self.use_stage3:
+            self._ensure_stage3()
             stage2_mesh = trimesh.Trimesh(vertices=verts, faces=faces)
             verts, faces = pamo_safe_project.process(
                 self.gt_mesh.vertices,
@@ -173,10 +210,10 @@ class PaMO(nn.Module):
                 stage2_mesh.vertices,
                 stage2_mesh.faces,
                 5,
-                system=self.system,  # if provided, reuse the same system to avoid memory allocation
-                config=self.config,  # if system is not provided, use this config to create a new system
+                system=self.system,  # if provided, reuse the same system
+                config=self.config,
             )
-            
+
         return verts, faces
 
 

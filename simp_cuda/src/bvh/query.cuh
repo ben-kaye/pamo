@@ -1,6 +1,10 @@
 #ifndef LBVH_QUERY_CUH
 #define LBVH_QUERY_CUH
 #define STACK_SIZE 256
+// Sentinel returned when the fixed DFS stack would overflow. Callers must treat
+// this as a hard failure: a partial candidate set can miss real intersections,
+// and the per-face max_candidates cap cannot detect that truncation.
+#define LBVH_STACK_OVERFLOW 0xFFFFFFFFu
 #include "predicator.cuh"
 
 namespace lbvh
@@ -8,6 +12,7 @@ namespace lbvh
     // face_i_raw[obj * face_i_stride] == -1 means deleted face (skip as partner).
     // For packed Triangle<int> {i,j,k}, pass (int*)F and face_i_stride=3.
     // max_candidates caps pairs counted/written per query.
+    // Returns LBVH_STACK_OVERFLOW if the fixed traversal stack fills.
     template <typename Real, typename Objects, bool IsConst>
     __device__ unsigned int get_number_of_intersect_candidates(
         const detail::basic_device_bvh<Real, Objects, IsConst> &bvh,
@@ -27,9 +32,9 @@ namespace lbvh
         unsigned int num_found = 0;
         do
         {
-            // Prevent local stack overflow on degenerate trees.
+            // Fixed stack full: fail loudly rather than silently truncating.
             if (stack_ptr - stack >= STACK_SIZE - 2)
-                break;
+                return LBVH_STACK_OVERFLOW;
 
             const index_type node = *--stack_ptr;
             const index_type L_idx = bvh.nodes[node].left_idx;
@@ -79,6 +84,8 @@ namespace lbvh
     // dfs code ----------------------
     // Writes (query_idx, obj_idx) pairs into outiter starting at index `first`.
     // Each pair occupies 2 slots. Stops at max_candidates pairs.
+    // Returns LBVH_STACK_OVERFLOW if the fixed traversal stack fills (partial
+    // writes may have already occurred; host must not trust the list).
     template <typename Real, typename Objects, bool IsConst, typename OutputIterator>
     __device__ unsigned int query_device(
         const detail::basic_device_bvh<Real, Objects, IsConst> &bvh,
@@ -102,7 +109,7 @@ namespace lbvh
         do
         {
             if (stack_ptr - stack >= STACK_SIZE - 2)
-                break;
+                return LBVH_STACK_OVERFLOW;
 
             const index_type node = *--stack_ptr;
             const index_type L_idx = bvh.nodes[node].left_idx;

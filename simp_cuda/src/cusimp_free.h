@@ -237,8 +237,10 @@ namespace cusimp_free
     uint32_t *__restrict__ original_edge_cost{};     // cost for each edge
 
     int *__restrict__ collapsed_edge_idx{}; // index of collpsed edge
+    size_t allocated_collapsed_edge_idx{};
     int * n_edges_undo{}; // number of undo candidate 
     int * edges_undo{}; // edge index of undo candidate
+    size_t allocated_edges_undo{};
 
     int *__restrict__ vertices_undo_list{};
     int *__restrict__ tmp_vertices_undo_list{};
@@ -249,6 +251,13 @@ namespace cusimp_free
     int * __restrict__ query_triangle_list{};
     unsigned int *__restrict__ intersected_triangle_idx{};
     int * n_intersect{};
+
+    // Phase B #4: pooled SI scratch (reused across self_intersect calls)
+    unsigned int *si_is_intersect{};
+    unsigned int *si_total{};
+    unsigned int *si_stored{};
+    unsigned int *si_intersections{};
+    size_t allocated_si_intersections{};
 
     // for lbvh
     thrust::device_vector<selfx::Triangle<float3>> bvh_triangles; // to construct bvh
@@ -274,6 +283,8 @@ namespace cusimp_free
     __host__ void ensure_vert_Q_storage_size(size_t n_pts);
     __host__ void ensure_edge_cost_storage_size(size_t n_edges);
     __host__ void ensure_tri_min_cost_storage_size(size_t n_tris);
+    __host__ void ensure_collapse_scratch(size_t n_edges);
+    __host__ void ensure_undo_scratch(size_t n_collapsed);
 
     // triangles must start from 0
     __host__ void forward(Vertex<float> *pts, Triangle<int> *tris, int* verts_undo, int n_verts_undo, int nPts, int nTris, float scale, float threshold, bool is_stuck, bool init);

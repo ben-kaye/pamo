@@ -14,11 +14,13 @@
 #include "tri_tri_3d.cuh"
 #include "tri_tri_2d.cuh"
 
-// Max AABB-overlap candidates per face. Each candidate packs as 2 uints
-// (query_idx, other_idx), so per-face worst-case write is 2 * BUFFER_SIZE.
-// Hitting this cap is treated as a hard failure (AUDIT P0-3) rather than a
-// silent guarantee reduction. Two-pass uncapped packing is deferred.
-#define BUFFER_SIZE 512
+// Phase B #3: no per-face candidate correctness cap. Count/scan/fill is
+// two-pass and grows the packed buffer to the exclusive-scan total.
+// (Previous BUFFER_SIZE=512 hard-failed and weakened the SI guarantee.)
+// Soft resource limit: refuse pathological totals rather than OOM the machine.
+#ifndef SELF_X_MAX_TOTAL_SLOTS
+#define SELF_X_MAX_TOTAL_SLOTS (1u << 28)  // ~1 GiB of uints max for candidates
+#endif
 
 using namespace std;
 
@@ -66,8 +68,8 @@ namespace selfx{
     }
 
     // F is Triangle<int>{i,j,k}; face.i == -1 marks deleted. Query sees this as
-    // int* with stride 3 so partner leaves with i==-1 are skipped (do not burn
-    // candidate slots on deleted faces clustered at the origin placeholder).
+    // int* with stride 3 so partner leaves with i==-1 are skipped.
+    // Uncapped count (max_candidates default = UINT_MAX).
     __global__ void compute_num_of_query_result_kernel(
         cusimp_free::Triangle<int>* F_d_raw,
         lbvh::bvh_device<float, selfx::Triangle<float3>> bvh_dev,
@@ -95,7 +97,13 @@ namespace selfx{
         const int *face_i_raw = reinterpret_cast<const int *>(F_d_raw);
         unsigned int num_found = lbvh::get_number_of_intersect_candidates(
             bvh_dev, lbvh::overlaps(query_box), (unsigned int)idx,
-            face_i_raw, /*stride=*/3u, (unsigned int)BUFFER_SIZE);
+            face_i_raw, /*stride=*/3u);
+        // LBVH_STACK_OVERFLOW and 2*count wrap both become this sentinel.
+        // Host must hard-fail before exclusive_scan (partial counts miss SI).
+        if (num_found == LBVH_STACK_OVERFLOW || num_found > 0x7FFFFFFFu) {
+            num_found_query_raw[idx] = LBVH_STACK_OVERFLOW;
+            return;
+        }
         // Store slot count (2 uints per candidate pair) for exclusive_scan.
         num_found_query_raw[idx] = 2u * num_found;
     }
@@ -104,6 +112,7 @@ namespace selfx{
         cusimp_free::Triangle<int>* F_d_raw,
         lbvh::bvh_device<float, selfx::Triangle<float3>> bvh_dev,
         unsigned int* first_query_result_raw,
+        unsigned int* num_found_query_raw,
         unsigned int* intersect_candidates_raw,
         std::size_t num_faces)
     {
@@ -124,22 +133,49 @@ namespace selfx{
 
         const int *face_i_raw = reinterpret_cast<const int *>(F_d_raw);
         unsigned int first = first_query_result_raw[idx];
-        lbvh::query_device(bvh_dev, lbvh::overlaps(query_box),
-                          intersect_candidates_raw, (unsigned int)idx, first,
-                          face_i_raw, /*stride=*/3u, (unsigned int)BUFFER_SIZE);
+        // Cap fill to the count-pass slot budget so a second traversal that
+        // finds more (should not happen) cannot scribble past exclusive_scan.
+        unsigned int slots = num_found_query_raw[idx];
+        unsigned int max_pairs = slots / 2u;
+        // Count pass already hard-fails on stack overflow; ignore return here.
+        (void)lbvh::query_device(bvh_dev, lbvh::overlaps(query_box),
+                                 intersect_candidates_raw, (unsigned int)idx, first,
+                                 face_i_raw, /*stride=*/3u, max_pairs);
     }
 
     void ensure_bvh_storage_size(cusimp_free::CUSimp_Free *sp)
     {
         // resize (not just reserve): self_intersect writes [0, num_faces) and
         // exclusive_scan reads/writes a +1 past-the-end total slot.
-        // Candidate packing: 2 uints per pair, up to BUFFER_SIZE pairs/face
-        // => worst-case total = allocated_tris * BUFFER_SIZE * 2.
+        // Phase B #3: do NOT pre-size candidates to F * 512 * 2. Capacity is
+        // grown after the count pass from exclusive_scan totals.
         sp->bvh_triangles.resize(sp->allocated_tris);
         sp->num_found_query.resize(sp->allocated_tris + 1);
         sp->first_query_result.resize(sp->allocated_tris + 1);
-        sp->intersect_candidates.resize(
-            (size_t)sp->allocated_tris * (size_t)BUFFER_SIZE * 2u);
+    }
+
+    // Phase B #4: grow-only SI scratch pool (no per-call cudaMalloc/Free).
+    void ensure_si_scratch(cusimp_free::CUSimp_Free *sp, unsigned int capacity_ints)
+    {
+        if (sp->si_is_intersect == nullptr) {
+            SELF_X_CHECK(cudaMalloc((void **)&sp->si_is_intersect, sizeof(unsigned int)));
+        }
+        if (sp->si_total == nullptr) {
+            SELF_X_CHECK(cudaMalloc((void **)&sp->si_total, sizeof(unsigned int)));
+        }
+        if (sp->si_stored == nullptr) {
+            SELF_X_CHECK(cudaMalloc((void **)&sp->si_stored, sizeof(unsigned int)));
+        }
+        if (capacity_ints > sp->allocated_si_intersections) {
+            size_t new_cap = (size_t)capacity_ints + (size_t)capacity_ints / 5u + 1u;
+            SELF_X_CHECK(cudaFree(sp->si_intersections));
+            sp->si_intersections = nullptr;
+            if (new_cap > 0) {
+                SELF_X_CHECK(cudaMalloc((void **)&sp->si_intersections,
+                                        new_cap * sizeof(unsigned int)));
+            }
+            sp->allocated_si_intersections = new_cap;
+        }
     }
 
     __device__
@@ -170,8 +206,6 @@ namespace selfx{
 
         cusimp_free::Vertex<float>* V_d_raw = sp->points;
         cusimp_free::Triangle<int>* F_d_raw = sp->triangles;
-        int* pts_occ_raw = sp->pts_occ;
-        int* near_tris_raw = sp->near_tris;
         Triangle<float3>* triangles_d_raw = thrust::raw_pointer_cast(sp->bvh_triangles.data());
 
         // get triangle data to build bvh -----------------
@@ -218,11 +252,28 @@ namespace selfx{
         unsigned int* first_query_result_raw = thrust::raw_pointer_cast(sp->first_query_result.data());
 
         const int n_blocks = (int)((num_faces + BLOCK_SIZE - 1) / BLOCK_SIZE);
-        // get number of intersection candidates (slot counts per face)
+        // Pass 1: count AABB-overlap candidates per face (uncapped).
         compute_num_of_query_result_kernel<<<n_blocks, BLOCK_SIZE>>>(
             F_d_raw, bvh_dev, num_found_results_raw, num_faces);
         SELF_X_CHECK(cudaGetLastError());
         SELF_X_CHECK(cudaDeviceSynchronize());
+
+        // Fail before exclusive_scan: LBVH_STACK_OVERFLOW is 0xFFFFFFFF and would
+        // poison the prefix sum. Truncated walks miss real intersections.
+        {
+            thrust::device_ptr<unsigned int> num_found_ptr(num_found_results_raw);
+            unsigned int max_slots = thrust::reduce(
+                thrust::device, num_found_ptr, num_found_ptr + num_faces, 0u,
+                thrust::maximum<unsigned int>());
+            if (max_slots == LBVH_STACK_OVERFLOW) {
+                throw std::runtime_error(
+                    "self_intersect: BVH traversal stack overflow (STACK_SIZE=" +
+                    std::to_string(STACK_SIZE) +
+                    "); candidate set may be incomplete. "
+                    "Intersection guarantee cannot be maintained.");
+            }
+        }
+
         thrust::exclusive_scan(thrust::device, num_found_results_raw,
                                num_found_results_raw + num_faces + 1,
                                sp->first_query_result.data());
@@ -232,70 +283,63 @@ namespace selfx{
         SELF_X_CHECK(cudaMemcpy(&total_slots, first_query_result_raw + num_faces,
                                 sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
-        // Detect per-face candidate cap hits (num_found_query stores 2 * count).
-        // A face that saturates BUFFER_SIZE may have missed real candidates.
-        {
-            thrust::device_ptr<unsigned int> num_found_ptr(num_found_results_raw);
-            unsigned int max_slots = thrust::reduce(
-                thrust::device, num_found_ptr, num_found_ptr + num_faces, 0u,
-                thrust::maximum<unsigned int>());
-            if (max_slots >= 2u * (unsigned int)BUFFER_SIZE) {
-                throw std::runtime_error(
-                    "self_intersect: per-face AABB candidate cap (" +
-                    std::to_string(BUFFER_SIZE) +
-                    ") hit; intersection guarantee cannot be maintained. "
-                    "Retry with a coarser mesh or raise BUFFER_SIZE.");
-            }
+        if (total_slots > (unsigned int)SELF_X_MAX_TOTAL_SLOTS) {
+            throw std::runtime_error(
+                "self_intersect: candidate packing total_slots=" +
+                std::to_string(total_slots) + " exceeds resource limit " +
+                std::to_string((unsigned int)SELF_X_MAX_TOTAL_SLOTS) +
+                " (pathological AABB density).");
         }
 
-        // Grow candidate buffer if exclusive_scan total exceeds capacity
-        // (should not with per-face cap, but keep safe for future cap changes).
+        // Pass 2 prep: grow packed candidate buffer to exclusive_scan total.
         if ((size_t)total_slots > sp->intersect_candidates.size()) {
             sp->intersect_candidates.resize((size_t)total_slots + (size_t)total_slots / 5u + 1u);
         }
-        thrust::fill(thrust::device, sp->intersect_candidates.begin(),
-                     sp->intersect_candidates.end(), 0xFFFFFFFFu);
+        if (total_slots > 0) {
+            thrust::fill(thrust::device, sp->intersect_candidates.begin(),
+                         sp->intersect_candidates.begin() + total_slots, 0xFFFFFFFFu);
+        }
         unsigned int* intersect_candidates_raw =
             thrust::raw_pointer_cast(sp->intersect_candidates.data());
         first_query_result_raw = thrust::raw_pointer_cast(sp->first_query_result.data());
+        num_found_results_raw = thrust::raw_pointer_cast(sp->num_found_query.data());
 
-        // save data of intersection candidates
-        compute_query_list_kernel<<<n_blocks, BLOCK_SIZE>>>(
-            F_d_raw, bvh_dev, first_query_result_raw, intersect_candidates_raw, num_faces);
-        SELF_X_CHECK(cudaGetLastError());
-        SELF_X_CHECK(cudaDeviceSynchronize());
+        // Pass 2: pack (query, partner) pairs into the scanned layout.
+        if (total_slots > 0) {
+            compute_query_list_kernel<<<n_blocks, BLOCK_SIZE>>>(
+                F_d_raw, bvh_dev, first_query_result_raw, num_found_results_raw,
+                intersect_candidates_raw, num_faces);
+            SELF_X_CHECK(cudaGetLastError());
+            SELF_X_CHECK(cudaDeviceSynchronize());
+        }
 
         // Actual tri-tri intersection test based on intersection candidates ----
-        unsigned int h_isIntersect = 0;
-        unsigned int* d_isIntersect = nullptr;
-        SELF_X_CHECK(cudaMalloc((void**)&d_isIntersect, sizeof(unsigned int)));
-        SELF_X_CHECK(cudaMemcpy(d_isIntersect, &h_isIntersect, sizeof(unsigned int), cudaMemcpyHostToDevice));
-
-        // Result buffer: capacity is face-proportional. Record total vs stored
-        // separately so consumers never OOB-read past capacity (AUDIT P0-2).
+        // Phase B #4: reuse pooled SI scratch (no per-call malloc/free).
         const unsigned int capacity_ints = 2u * (unsigned int)num_faces;
-        unsigned int* d_intersections = nullptr;
-        if (capacity_ints > 0) {
-            SELF_X_CHECK(cudaMalloc((void**)&d_intersections,
-                                    (size_t)capacity_ints * sizeof(unsigned int)));
+        ensure_si_scratch(sp, capacity_ints);
+
+        unsigned int* d_isIntersect = sp->si_is_intersect;
+        unsigned int* d_intersections = sp->si_intersections;
+        unsigned int* d_total = sp->si_total;
+        unsigned int* d_stored = sp->si_stored;
+
+        unsigned int h_isIntersect = 0;
+        SELF_X_CHECK(cudaMemcpy(d_isIntersect, &h_isIntersect, sizeof(unsigned int), cudaMemcpyHostToDevice));
+        SELF_X_CHECK(cudaMemset(d_total, 0, sizeof(unsigned int)));
+        SELF_X_CHECK(cudaMemset(d_stored, 0, sizeof(unsigned int)));
+        if (capacity_ints > 0 && d_intersections != nullptr) {
             SELF_X_CHECK(cudaMemset(d_intersections, 0xFF,
                                     (size_t)capacity_ints * sizeof(unsigned int)));
         }
 
-        unsigned int* d_total = nullptr;   // raw atomic counter (may exceed capacity)
-        unsigned int* d_stored = nullptr;  // number of ints actually written
-        SELF_X_CHECK(cudaMalloc(&d_total, sizeof(unsigned int)));
-        SELF_X_CHECK(cudaMalloc(&d_stored, sizeof(unsigned int)));
-        SELF_X_CHECK(cudaMemset(d_total, 0, sizeof(unsigned int)));
-        SELF_X_CHECK(cudaMemset(d_stored, 0, sizeof(unsigned int)));
-
         // actual number of candidate pairs (each pair is 2 slots)
         unsigned int num_query_result = total_slots / 2u;
 
-        thrust::for_each(thrust::device,
-                         thrust::make_counting_iterator<unsigned int>(0),
-                         thrust::make_counting_iterator<unsigned int>(num_query_result),
-                         [epsilon, d_isIntersect, d_total, d_stored, d_intersections, capacity_ints, triangles_d_raw, intersect_candidates_raw, F_d_raw] __device__(std::size_t idx) {
+        if (num_query_result > 0) {
+            thrust::for_each(thrust::device,
+                             thrust::make_counting_iterator<unsigned int>(0),
+                             thrust::make_counting_iterator<unsigned int>(num_query_result),
+                             [epsilon, d_isIntersect, d_total, d_stored, d_intersections, capacity_ints, triangles_d_raw, intersect_candidates_raw, F_d_raw] __device__(std::size_t idx) {
                                 unsigned int query_idx = intersect_candidates_raw[2 * idx];
                                 unsigned int current_idx = intersect_candidates_raw[2 * idx + 1];
 
@@ -391,7 +435,8 @@ namespace selfx{
                                     }
                                 }
                          });
-        SELF_X_CHECK(cudaDeviceSynchronize());
+            SELF_X_CHECK(cudaDeviceSynchronize());
+        }
 
         unsigned int h_total = 0;
         unsigned int h_stored = 0;
@@ -400,7 +445,8 @@ namespace selfx{
 
         // Copy only the stored ints into the persistent buffer; n_intersect is
         // the stored count so get_undo_candidate never walks past capacity.
-        if (capacity_ints > 0 && h_stored > 0 && sp->intersected_triangle_idx != nullptr) {
+        if (capacity_ints > 0 && h_stored > 0 && sp->intersected_triangle_idx != nullptr
+            && d_intersections != nullptr) {
             unsigned int copy_n = h_stored < capacity_ints ? h_stored : capacity_ints;
             SELF_X_CHECK(cudaMemcpy(sp->intersected_triangle_idx, d_intersections,
                                     (size_t)copy_n * sizeof(unsigned int),
@@ -411,12 +457,7 @@ namespace selfx{
                                     cudaMemcpyHostToDevice));
         }
 
-        if (d_intersections) SELF_X_CHECK(cudaFree(d_intersections));
-        SELF_X_CHECK(cudaFree(d_total));
-        SELF_X_CHECK(cudaFree(d_stored));
-
         SELF_X_CHECK(cudaMemcpy(&h_isIntersect, d_isIntersect, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-        SELF_X_CHECK(cudaFree(d_isIntersect));
 
         if (h_total > capacity_ints) {
             throw std::runtime_error(

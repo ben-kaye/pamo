@@ -37,8 +37,12 @@ class Stage3System:
         self._init_counters()
         self._init_capacity_fields()
         self._init_scalar_arrays()
+        # Phase B #5: energy calculators are empty until first ensure/use
+        # when config.lazy_calculators (default True).
         self._init_energy_calcs()
 
+        # CGSolver owns buffers that grow with ensure_capacity; construct now
+        # (cheap under auto_capacity) so step() never has to special-case None.
         self.cg_solver = CGSolver(self)
         self.line_search_graph = None
         self.do_nothing = False
@@ -204,10 +208,28 @@ class Stage3System:
                 self.cap_faces = new_MF
 
             if grow_E:
+                # Preserve uploaded edge topology / AABBs when growing after
+                # register_mesh (zeroed realloc would poison collision detection).
+                n_keep_e = min(int(self.n_edges), int(self.cap_edges))
+                old_edges = self.edges
+                old_edge_lowers = self.edge_lowers
+                old_edge_uppers = self.edge_uppers
                 self.edges = wp.zeros((new_ME, 2), dtype=wp.int32)
                 self.edge_lowers = wp.zeros(new_ME, dtype=wp.vec3)
                 self.edge_uppers = wp.zeros(new_ME, dtype=wp.vec3)
+                if n_keep_e > 0:
+                    wp_slice(self.edges, 0, n_keep_e).assign(
+                        old_edges.numpy()[:n_keep_e]
+                    )
+                    wp.copy(self.edge_lowers, old_edge_lowers, count=n_keep_e)
+                    wp.copy(self.edge_uppers, old_edge_uppers, count=n_keep_e)
                 self.cap_edges = new_ME
+                # BVH holds views of the old arrays; rebuild if one exists.
+                if n_keep_e > 0 and getattr(self, "edge_bvh", None) is not None:
+                    self.edge_bvh = wp.Bvh(
+                        wp_slice(self.edge_lowers, 0, self.n_edges),
+                        wp_slice(self.edge_uppers, 0, self.n_edges),
+                    )
 
             if grow_P_GT:
                 self.gt_vertices = wp.zeros(new_MP_GT, dtype=wp.vec3)
@@ -231,6 +253,7 @@ class Stage3System:
             self.cg_solver.clear()
         self.line_search_graph = None
 
+        # Only grow already-constructed calculators; lazy ones allocate on first use.
         if hasattr(self, "energy_calcs"):
             for ec in self.energy_calcs.values():
                 if hasattr(ec, "ensure_capacity"):
@@ -242,18 +265,35 @@ class Stage3System:
         self._init_counters()
         self.cg_solver.clear()
         self.line_search_graph = None
-        for k in self.config.energy_calcs:
-            if not k in self.energy_calcs:
-                self.energy_calcs[k] = k(self)
-                if hasattr(self.energy_calcs[k], "ensure_capacity"):
-                    self.energy_calcs[k].ensure_capacity()
+        # Keep already-built calculators; ensure any newly enabled classes exist
+        # only when needed (lazy) or rebuild missing entries for eager mode.
+        if not getattr(self.config, "lazy_calculators", True):
+            for k in self.config.energy_calcs:
+                if k not in self.energy_calcs:
+                    self.energy_calcs[k] = k(self)
+                    if hasattr(self.energy_calcs[k], "ensure_capacity"):
+                        self.energy_calcs[k].ensure_capacity()
         self.do_nothing = False
 
-    def _get_energy_calculator(self, cls: type):
-        if cls in self.config.energy_calcs:
-            return self.energy_calcs[cls]
-        else:
+    def _ensure_energy_calculator(self, cls: type):
+        """Instantiate calculator for cls if enabled and not yet built."""
+        if cls is None or cls not in self.config.energy_calcs:
             return None
+        ec = self.energy_calcs.get(cls)
+        if ec is None:
+            ec = cls(self)
+            if hasattr(ec, "ensure_capacity"):
+                ec.ensure_capacity()
+            self.energy_calcs[cls] = ec
+            logger.debug(f"Lazy-built energy calculator: {getattr(cls, 'name', cls)}")
+        return ec
+
+    def _get_energy_calculator(self, cls: type):
+        if cls not in self.config.energy_calcs:
+            return None
+        if getattr(self.config, "lazy_calculators", True):
+            return self._ensure_energy_calculator(cls)
+        return self.energy_calcs.get(cls)
 
     def _refit_edge_bvh(self, x):
         with wp.ScopedDevice(self.device):
@@ -324,11 +364,15 @@ class Stage3System:
 
         # Mesh-sized allocation (Phase B P1-2). Contact buffer heuristic scales
         # with edges; overflow grows geometrically inside detect_contact.
+        # Clamp to max_blocks: the hint is only initial capacity, not a hard
+        # requirement (runtime overflow handling can grow up to the ceiling).
+        bpe = int(getattr(c, "blocks_per_edge", 16))
         n_blocks_hint = max(
             int(getattr(c, "min_blocks", 1 << 16)),
-            NE * int(getattr(c, "blocks_per_edge", 16)),
-            NP * int(getattr(c, "blocks_per_edge", 16)),
+            NE * bpe,
+            NP * bpe,
         )
+        n_blocks_hint = min(n_blocks_hint, int(c.max_blocks))
         self.ensure_capacity(
             n_particles=NP,
             n_faces=NT,
@@ -427,8 +471,9 @@ class Stage3System:
 
     def _energy_preprocess(self, V, F):
         for k in self.config.energy_calcs:
-            ec: EnergyCalculator = self.energy_calcs.get(k, None)
-            ec.preprocess(V, F)
+            ec: EnergyCalculator = self._ensure_energy_calculator(k)
+            if ec is not None:
+                ec.preprocess(V, F)
 
     def _update_vertex_target(self):
         ec_mesh2gt: Mesh2GTDistanceEnergyCalculator = self._get_energy_calculator(
@@ -472,15 +517,24 @@ class Stage3System:
         wp.copy(self.q_prev_detection, self.q, count=self.n_particles)
 
     def _init_energy_calcs(self):
+        """Create calculator dict. Eager mode builds all; lazy mode defers to first use."""
         self.energy_calcs = {}
-        for ec in self.config.energy_calcs:
-            self.energy_calcs[ec] = ec(self)
+        if not getattr(self.config, "lazy_calculators", True):
+            for ec in self.config.energy_calcs:
+                self.energy_calcs[ec] = ec(self)
+
+    def _iter_energy_calcs(self):
+        """Yield enabled calculators in config order, constructing lazily if needed."""
+        for k in self.config.energy_calcs:
+            ec = self._ensure_energy_calculator(k)
+            if ec is not None:
+                yield ec
 
     def _compute_energy(self, verbose=False):
         self.energy.zero_()
         last_energy = 0.0
         energy_vals = {}
-        for ec in self.energy_calcs.values():
+        for ec in self._iter_energy_calcs():
             ec: EnergyCalculator
             ec.compute_energy(self.q, self.energy)
             if verbose:
@@ -495,14 +549,12 @@ class Stage3System:
     def _compute_diff(self):
         self.grad.zero_()
         self.hess_diag.zero_()
-        for k in self.config.energy_calcs:
-            ec: EnergyCalculator = self.energy_calcs.get(k, None)
+        for ec in self._iter_energy_calcs():
             ec.compute_diff(self.q, -1.0, self.grad, self.hess_diag)
 
     def _compute_hess_dx(self, dx: wp.array, hess_dx: wp.array):
         hess_dx.zero_()
-        for k in self.config.energy_calcs:
-            ec: EnergyCalculator = self.energy_calcs.get(k, None)
+        for ec in self._iter_energy_calcs():
             ec.compute_hess_dx(self.q, dx, hess_dx)
 
     def _clamp_p(self):

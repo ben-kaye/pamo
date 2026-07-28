@@ -22,6 +22,10 @@ class Stage3Config:
         self.min_blocks = 1 << 16  # floor for contact-pair buffer
         self.blocks_per_edge = 16  # initial contact capacity heuristic vs n_edges
 
+        # Phase B #5: construct energy calculators on first use (not at system init).
+        # Set False to restore eager construction of every class in energy_calcs.
+        self.lazy_calculators = True
+
         # Solver parameters
         self.n_newton_iters = 10  # Number of Newton iterations per Step
         self.n_cg_iters = 40  # Number of CG iterations per Newton iteration

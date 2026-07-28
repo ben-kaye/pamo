@@ -3,6 +3,7 @@
 #include "thrust/sort.h"
 #include "thrust/fill.h"
 #include <math.h>
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -207,6 +208,41 @@ namespace cusimp_free
             CHECK_CUDA(cudaFree(tri_min_cost));
             CHECK_CUDA(
                 cudaMalloc((void **)&tri_min_cost, (allocated_tri_min_cost + 1) * sizeof(uint64_cu)));
+        }
+    }
+
+    // Phase B #4: grow-only collapse/undo scratch (no free+malloc each forward).
+    void CUSimp_Free::ensure_collapse_scratch(size_t edge_count)
+    {
+        if (n_collapsed == nullptr) {
+            CHECK_CUDA(cudaMalloc((void **)&n_collapsed, sizeof(int)));
+        }
+        if (n_intersect == nullptr) {
+            CHECK_CUDA(cudaMalloc((void **)&n_intersect, sizeof(unsigned int)));
+        }
+        if (n_edges_undo == nullptr) {
+            CHECK_CUDA(cudaMalloc((void **)&n_edges_undo, sizeof(int)));
+        }
+        if (edge_count > allocated_collapsed_edge_idx) {
+            size_t new_cap = size_t(edge_count + edge_count / 5);
+            CHECK_CUDA(cudaFree(collapsed_edge_idx));
+            CHECK_CUDA(cudaMalloc((void **)&collapsed_edge_idx, new_cap * sizeof(int)));
+            allocated_collapsed_edge_idx = new_cap;
+        }
+    }
+
+    void CUSimp_Free::ensure_undo_scratch(size_t n_collapsed_count)
+    {
+        // edges_undo holds 2 ints per collapsed edge.
+        size_t need = 2 * n_collapsed_count;
+        if (need == 0) {
+            return;
+        }
+        if (need > allocated_edges_undo) {
+            size_t new_cap = size_t(need + need / 5);
+            CHECK_CUDA(cudaFree(edges_undo));
+            CHECK_CUDA(cudaMalloc((void **)&edges_undo, new_cap * sizeof(int)));
+            allocated_edges_undo = new_cap;
         }
     }
 
@@ -1004,33 +1040,23 @@ namespace cusimp_free
         CHECK_CUDA(cudaMemcpy(tri_min_cost, temp.data(), n_tris * sizeof(uint64_cu), cudaMemcpyHostToDevice));
         propagate_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
-        // collapsed edge — free before re-malloc: previous forward() left these
-        // allocated (only n_intersect was freed). Multi-iter stage-2 leaked
-        // collapsed_edge_idx (~O(n_edges) per call) and poisoned later runs.
-        CHECK_CUDA(cudaFree(n_collapsed));
-        CHECK_CUDA(cudaMalloc((void **)&n_collapsed, sizeof(int)));
+        // collapsed edge — Phase B #4: pool/grow, never free+malloc every iter.
+        ensure_collapse_scratch((size_t)std::max(n_edges, 0));
         CHECK_CUDA(cudaMemset(n_collapsed, 0, sizeof(int)));
-        CHECK_CUDA(cudaFree(collapsed_edge_idx));
-        CHECK_CUDA(cudaMalloc((void **)&collapsed_edge_idx, n_edges * sizeof(int)));
-        CHECK_CUDA(cudaMemset(collapsed_edge_idx, 0, n_edges * sizeof(int)));
+        if (n_edges > 0 && collapsed_edge_idx != nullptr) {
+            CHECK_CUDA(cudaMemset(collapsed_edge_idx, 0, (size_t)n_edges * sizeof(int)));
+        }
         if (n_edges > 0) {
             collapse_edge_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
         }
 
-        // check num_collapsed-----------
-        CHECK_CUDA(cudaFree(n_intersect));
-        CHECK_CUDA(cudaMalloc((void **)&n_intersect, sizeof(unsigned int)));
         CHECK_CUDA(cudaMemset(n_intersect, 0, sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
 
         int h_n_collapsed = 0;
-        CHECK_CUDA(cudaFree(n_edges_undo));
-        CHECK_CUDA(cudaMalloc(&n_edges_undo, sizeof(int)));
-        CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
         CHECK_CUDA(cudaMemcpy(&h_n_collapsed, n_collapsed, sizeof(int), cudaMemcpyDeviceToHost));
-        CHECK_CUDA(cudaFree(edges_undo));
-        edges_undo = nullptr;
         if (h_n_collapsed > 0) {
-            CHECK_CUDA(cudaMalloc(&edges_undo, 2 * (size_t)h_n_collapsed * sizeof(int)));
+            ensure_undo_scratch((size_t)h_n_collapsed);
             CHECK_CUDA(cudaMemset(edges_undo, 0, 2 * (size_t)h_n_collapsed * sizeof(int)));
         }
 
@@ -1078,10 +1104,6 @@ namespace cusimp_free
         ensure_temp_storage_size(temp_storage_bytes);
         cub::DeviceScan::ExclusiveSum(temp_storage, allocated_temp_storage_size, pts_map, pts_map, n_pts + 1);
 
-        // Keep member pointers valid for next forward(); free happens on re-alloc
-        // or CUSimp destructor (pybind). n_intersect used only within this call
-        // path but held as member — free now to match prior behavior.
-        CHECK_CUDA(cudaFree(n_intersect));
-        n_intersect = nullptr;
+        // n_intersect / SI / collapse scratch stay pooled for the next forward().
     }
 }
