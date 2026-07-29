@@ -403,8 +403,10 @@ namespace selfx{
                                 copy_v3_v3_float_float3(tri_b[1], q2);
                                 copy_v3_v3_float_float3(tri_b[2], r2);
 
-                                // Filters (not true self-intersections for our mesh):
-                                //  - coplanar: no implemented coplanar test; skip
+                                // Filters (not true self-intersections for collapse undo):
+                                //  - coplanar: intentionally skipped (AUDIT_2 P1 deferred).
+                                //    Guigue / proper-interior both stall DMC remesh collapse
+                                //    (HANDOFF10: bust ~10–13× faces). No runtime flag.
                                 //  - num_count==2 or coord-shared edge: manifold neighbors
                                 //  - shared vertex + tiny intersection segment: contact at vertex
                                 if(is_coplanar(tri_a, tri_b)){

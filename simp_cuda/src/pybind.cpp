@@ -1,6 +1,9 @@
 #include "cusimp.h"
 #include "cusimp_free.h"
 #include <torch/extension.h>
+#include <optional>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cmath>
 #include <limits>
 
@@ -66,9 +69,14 @@ namespace cusimp_free
   class CUDSP_Free
   {
     CUSimp_Free pamo;
+    c10::DeviceIndex bound_device_ = -1;
 
     void release()
     {
+      std::optional<c10::cuda::CUDAGuard> guard;
+      if (bound_device_ >= 0) {
+        guard.emplace(c10::Device(c10::kCUDA, bound_device_));
+      }
       cudaDeviceSynchronize();
       // cudaFree(nullptr) is a no-op; free every owned buffer once.
       cudaFree(pamo.temp_storage); pamo.temp_storage = nullptr;
@@ -98,7 +106,7 @@ namespace cusimp_free
       cudaFree(pamo.query_triangle_list); pamo.query_triangle_list = nullptr;
       cudaFree(pamo.intersected_triangle_idx); pamo.intersected_triangle_idx = nullptr;
       cudaFree(pamo.n_intersect); pamo.n_intersect = nullptr;
-      // Self-intersect / collapse scratch pool
+      // Phase B #4 SI / collapse scratch pool
       cudaFree(pamo.si_is_intersect); pamo.si_is_intersect = nullptr;
       cudaFree(pamo.si_total); pamo.si_total = nullptr;
       cudaFree(pamo.si_stored); pamo.si_stored = nullptr;
@@ -107,6 +115,7 @@ namespace cusimp_free
       pamo.allocated_collapsed_edge_idx = 0;
       pamo.allocated_edges_undo = 0;
       pamo.allocated_vertices_undo = 0;
+      bound_device_ = -1;
     }
 
 public:
@@ -121,6 +130,8 @@ public:
     {
       validate_mesh_tensors(points, triangles);
       CHECK_INPUT(verts_undo);
+      TORCH_CHECK(verts_undo.device() == points.device(),
+                  "verts_undo must be on the same device as points");
       TORCH_CHECK(verts_undo.dtype() == torch::kInt,
                   "verts_undo must be int32");
       TORCH_CHECK(n_verts_undo >= 0, "n_verts_undo must be non-negative");
@@ -130,6 +141,16 @@ public:
                   "scale must be finite and positive");
       TORCH_CHECK(std::isfinite(threshold) && threshold >= 0.0f,
                   "threshold must be finite and non-negative");
+
+      const c10::cuda::CUDAGuard device_guard(points.device());
+      const c10::DeviceIndex idx = points.get_device();
+      if (bound_device_ >= 0) {
+        TORCH_CHECK(bound_device_ == idx,
+                    "CUDSP_Free already allocated on device ", bound_device_,
+                    " but received tensors on device ", idx);
+      }
+      bound_device_ = idx;
+      at::cuda::getCurrentCUDAStream(idx).synchronize();
 
       torch::ScalarType scalarType = torch::kFloat;
       torch::ScalarType indexType = torch::kInt;
@@ -142,6 +163,8 @@ public:
             reinterpret_cast<int *>(verts_undo.data_ptr<int>()),
             n_verts_undo,
             nPts, nTris, scale, threshold, is_stuck, init);
+
+      cudaDeviceSynchronize();
 
       auto opts_f = torch::TensorOptions().device(points.device()).dtype(scalarType);
       auto opts_i = torch::TensorOptions().device(points.device()).dtype(indexType);

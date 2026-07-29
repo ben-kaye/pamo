@@ -15,14 +15,25 @@ from .metrics import compute_igl_CD_HD
 from .geometry import *
 
 
+def _default_stage3_device():
+    """Prefer the current torch CUDA device over hard-coded cuda:0."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return f"cuda:{torch.cuda.current_device()}"
+    except Exception:
+        pass
+    return "cuda:0"
+
+
 class Stage3System:
-    def __init__(self, config: Stage3Config = None, device="cuda:0"):
+    def __init__(self, config: Stage3Config = None, device=None):
         wp.init()
 
         if config is None:
             config = Stage3Config()
         self.config = config
-        self.device = device
+        self.device = device if device is not None else _default_stage3_device()
 
         if config.debug:
             if config.use_cuda_graph:

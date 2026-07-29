@@ -16,13 +16,24 @@ import pamo_safe_project
 import torchcumesh2sdf
 
 
+def _resolve_device(points):
+    """Prefer the input tensor device; fall back to current CUDA device."""
+    if isinstance(points, torch.Tensor) and points.is_cuda:
+        return points.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    raise RuntimeError("PaMO requires a CUDA tensor or available CUDA device")
+
+
 class PaMO(nn.Module):
-    def __init__(self, input_mesh, use_stage1=True, use_stage3=True):
+    def __init__(self, input_mesh, use_stage1=True, use_stage3=True, device=None):
         super().__init__()
         pamo = _C.CUDSP_Free()
 
         self.use_stage1 = use_stage1
         self.use_stage3 = use_stage3
+        # Optional sticky device; otherwise taken from points on each run().
+        self.device = torch.device(device) if device is not None else None
 
         print("Stage1 : ", self.use_stage1)
         print("Stage3 : ", self.use_stage3)
@@ -36,6 +47,8 @@ class PaMO(nn.Module):
         self.config = None
         self.system = None
         self.vol2mesh = None
+        self._stage1_device = None
+        self._stage3_device = None
 
         class DSPFunction(Function):
             @staticmethod
@@ -61,21 +74,27 @@ class PaMO(nn.Module):
         self.band = 3.0 / self.R
         self.margin = self.band * 2.0 + 1.0
 
-    def _ensure_stage1(self):
-        """Lazily construct Dual Marching Cubes when stage 1 is enabled."""
+    def _ensure_stage1(self, device):
+        """Lazily construct Dual Marching Cubes on the requested device."""
         if not self.use_stage1:
             return
-        if self.vol2mesh is None:
-            self.vol2mesh = DMC(dtype=torch.float32).cuda()
+        dev = torch.device(device)
+        if self.vol2mesh is None or self._stage1_device != dev:
+            self.vol2mesh = DMC(dtype=torch.float32).to(dev)
+            self._stage1_device = dev
 
-    def _ensure_stage3(self):
-        """Lazily construct Stage3System when stage 3 is enabled."""
+    def _ensure_stage3(self, device):
+        """Lazily construct Stage3System on the requested device."""
         if not self.use_stage3:
             return
+        dev = torch.device(device)
+        dev_str = str(dev)
         if self.config is None:
             self.config = pamo_safe_project.config.Stage3Config()
-        if self.system is None:
-            self.system = pamo_safe_project.system.Stage3System(self.config)
+        if self.system is None or self._stage3_device != dev:
+            self.system = pamo_safe_project.system.Stage3System(
+                self.config, device=dev_str)
+            self._stage3_device = dev
 
     def tri_area(self, v0, v1, v2):
         cross_prod = torch.cross(v1 - v0, v2 - v0)
@@ -97,7 +116,7 @@ class PaMO(nn.Module):
         return tris, tris_min, tris_max, tris_mean
 
     
-    def remesh(self, tris, tris_min, tris_max, tris_mean):
+    def remesh(self, tris, tris_min, tris_max, tris_mean, device):
         d = torchcumesh2sdf.get_sdf(tris, self.R, self.band)
         d = d - 0.9 / self.R
         
@@ -106,8 +125,8 @@ class PaMO(nn.Module):
         v, f = v.cpu().numpy(), f.cpu().numpy()
         v = (((v * self.R +0.5)/(self.R+1)* self.margin - self.band) * tris_max + tris_min)
         
-        v = torch.from_numpy(v).float().cuda()
-        f = torch.from_numpy(f).int().cuda()
+        v = torch.from_numpy(v).float().to(device)
+        f = torch.from_numpy(f).int().to(device)
         
         return v, f
 
@@ -132,7 +151,15 @@ class PaMO(nn.Module):
         self.target_faces = max(int(ratio * len(triangles)), min_faces)
         print("Target faces : {}".format(self.target_faces))
 
+        device = self.device if self.device is not None else _resolve_device(points)
+        if points.device != device:
+            points = points.to(device)
+        if triangles.device != device:
+            triangles = triangles.to(device)
+
         # Choose stage-1 resolution and recompute band/margin *before* normalize.
+        # Aggressive schedule for coarse targets: stage-1 remesh sets a floor
+        # that stage-2 cannot get under (§3.3).
         if self.use_stage1:
             if self.target_faces <= 50:
                 self._set_stage1_resolution(64)
@@ -146,27 +173,28 @@ class PaMO(nn.Module):
         # scale the input mesh
         tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(
             points, triangles, self.band, self.margin)
-        device = points.device if points.is_cuda else torch.device('cuda')
         tris = torch.tensor(tris, dtype=torch.float32, device=device)
 
         # stage1 (Remeshing)
         if self.use_stage1:
-            self._ensure_stage1()
+            self._ensure_stage1(device)
             start_stage1 = time.time()
-            verts, faces = self.remesh(tris, tris_min, tris_max, tris_mean)
+            verts, faces = self.remesh(tris, tris_min, tris_max, tris_mean, device)
             end_stage1 = time.time()
             print(f"Time for Remeshing: {end_stage1 - start_stage1} sec")
         else:
-            verts = points - torch.from_numpy(tris_mean).to(points.device)
+            verts = points - torch.from_numpy(tris_mean).to(device)
             faces = triangles
 
         # stage2 (Simplification) — skip if already at/under target
         start_stage2 = time.time()
         if faces.shape[0] > self.target_faces and faces.shape[0] > 10:
-            verts_undo = torch.empty(0, dtype=torch.int32, device=verts.device)
+            verts_undo = torch.empty(0, dtype=torch.int32, device=device)
             n_verts_undo = 0
             count = 0
             is_stuck = 0
+            # Working threshold may relax when progress stalls (§3.3).
+            thr = float(threshold)
             scale = max(
                 max(verts[:, 0].max() - verts[:, 0].min(),
                     verts[:, 1].max() - verts[:, 1].min()),
@@ -176,7 +204,7 @@ class PaMO(nn.Module):
             for it in range(iter):
                 num_faces_prev = faces.shape[0]
                 verts, faces, verts_occ, verts_map, verts_undo = self.func.apply(
-                    verts, faces, verts_undo, n_verts_undo, scale, threshold,
+                    verts, faces, verts_undo, n_verts_undo, scale, thr,
                     is_stuck, init)
                 init = False
                 n_verts_undo = verts_undo.shape[0]
@@ -212,7 +240,7 @@ class PaMO(nn.Module):
         
         # stage3 (Safe projection)
         if self.use_stage3:
-            self._ensure_stage3()
+            self._ensure_stage3(device)
             stage2_mesh = trimesh.Trimesh(vertices=verts, faces=faces)
             verts, faces = pamo_safe_project.process(
                 self.gt_mesh.vertices,
@@ -248,11 +276,6 @@ class PaSP(nn.Module):
         scale = max(max(verts[:,0].max()-verts[:,0].min(), verts[:,1].max()-verts[:,1].min()), verts[:,2].max()-verts[:,2].min())
         init = True
         for it in range(iter):
-            # if it < 20:
-            #     t = threshold / (21 - it) * 2
-            # else:
-            #     t = threshold
-            # print(t)
             num_faces = faces.shape[0]
             verts, faces, verts_occ, verts_map = self.func.apply(verts, faces, scale, threshold, init)
             verts = verts[verts_occ.view(-1).bool()]
@@ -261,16 +284,8 @@ class PaSP(nn.Module):
             faces[:,1] = verts_map[faces[:,1].long()].view(-1)
             faces[:,2] = verts_map[faces[:,2].long()].view(-1)
             init = False
-            # if faces.shape[0] < 4500:
-            #     break
             if faces.shape[0] == num_faces:
                 print("Converged at iteration {}".format(it))
                 break
 
-            # v = verts.cpu().numpy()
-            # f = faces.cpu().numpy()
-            # output_mesh = trimesh.Trimesh(vertices=v, faces=f)
-            # output_mesh.export('/home/sarahwei/code/simp_parallel/{}.obj'.format(it))
-
-        
         return verts, faces

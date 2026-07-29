@@ -20,6 +20,17 @@ def get_normalization_transform(V):
     return scale, t
 
 
+def _default_device_str():
+    """Warp device string for the current CUDA device (not hard-coded cuda:0)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return f"cuda:{torch.cuda.current_device()}"
+    except Exception:
+        pass
+    return "cuda:0"
+
+
 def process(
     gt_V,
     gt_F,
@@ -30,10 +41,14 @@ def process(
     config: Stage3Config = None,
     eval=False,
     return_curve=False,
+    device=None,
 ):      
     """
     Reuse system if provided, otherwise create a new one with the given
     config (if provided) or a default one (Stage3Config()).
+
+    device: Warp device string (e.g. "cuda:0"). Used only when creating a
+    new system; ignored when reusing an existing one.
     """
     # ------------------------ Initialize System ------------------------ #
     time_start = time.time()
@@ -43,7 +58,7 @@ def process(
         gc.collect()
         if config is None:
             config = Stage3Config()
-        system = Stage3System(config, "cuda:0")
+        system = Stage3System(config, device if device is not None else _default_device_str())
     else:
         system.clear()
 
