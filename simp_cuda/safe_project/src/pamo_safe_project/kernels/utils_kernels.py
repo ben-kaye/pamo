@@ -1,5 +1,7 @@
 import warp as wp
 
+from .spd_project_native import spd_project_blocks
+
 
 @wp.kernel
 def a_plus_k_b_kernel(
@@ -26,7 +28,8 @@ def block_spd_project_kernel(
 
     block = blocks[bid]
 
-    wp.spd_project_blocks(3, block, it_max)
+    # Stock warp-lang has no wp.spd_project_blocks; local func_native extension.
+    spd_project_blocks(3, block, it_max)
 
     block[3][0] = -block[0][0] - block[1][0] - block[2][0]
     block[3][1] = -block[0][1] - block[1][1] - block[2][1]

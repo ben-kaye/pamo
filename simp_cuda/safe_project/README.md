@@ -11,24 +11,12 @@
 
 ## Installation
 
-Clone this repository with the `--recurse-submodules` flag to include the submodules. 
+Stage 3 uses stock `warp-lang` 1.14 from PyPI. SPD block projection is a local
+`@wp.func_native` extension (`src/pamo_safe_project/kernels/spd_project_native.py`);
+there is no Rabbit-Hu `warp_` fork / `build_lib.py` step.
 
 ```bash
-git clone --recurse-submodules git@github.com:Rabbit-Hu/stage3.git
-```
-
-Build Warp and pip install it.
-
-```bash
-cd stage3/warp_
-python build_lib.py --cuda_path /usr/local/cuda  # Replace with your CUDA path
-pip install .
-```
-
-Finally install the stage3 package.
-
-```bash
-cd ..  # back to stage3
+pip install "warp-lang>=1.14,<1.15"
 pip install -e .
 ```
 

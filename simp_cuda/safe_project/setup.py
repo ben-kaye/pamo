@@ -10,5 +10,8 @@ setup(
         'scipy>=1.12.0',
         'trimesh>=4.0.10',
         'libigl>=2.5.1',
+        # Stock NVIDIA Warp; SPD projection is a local @wp.func_native extension
+        # (see kernels/spd_project_native.py), not the Rabbit-Hu warp fork.
+        'warp-lang>=1.14,<1.15',
     ],
 )
