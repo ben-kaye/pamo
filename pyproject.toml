@@ -1,0 +1,44 @@
+[project]
+name = "pamo-env"
+version = "0.1.0"
+description = "Isolated UV environment for building and running PaMO (sm_120 / CUDA 12.8)."
+requires-python = "==3.12.*"
+dependencies = [
+    "numpy==1.26.4",
+    "scipy",
+    "trimesh==4.4.0",
+    "libigl==2.5.1",
+    # 2.11 broke torch::from_blob for torchcumesh2sdf ("set_stride is not allowed
+    # on a Tensor created from .data or .detach()").  2.8 is the newest tested
+    # here that still builds PaMO's stage-1 extension and covers sm_120.
+    "torch==2.8.*",
+    # Stock NVIDIA Warp (PyPI).  Stage-3 SPD projection is a local @wp.func_native
+    # extension in pamo_safe_project — no Rabbit-Hu warp fork / build_lib.py.
+    "warp-lang>=1.15,<1.16",
+    # Stage packages (built against the torch above; see no-build-isolation-package).
+    "torchcumesh2sdf",
+    "pdmc",
+    "pamo",
+    "pamo-safe-project",
+]
+
+[tool.uv]
+package = false
+# These packages import torch (or depend on its headers) in setup.py.
+no-build-isolation-package = [
+    "torchcumesh2sdf",
+    "pdmc",
+    "pamo",
+    "pamo-safe-project",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchcumesh2sdf = { git = "https://github.com/eliphatfs/cumesh2sdf.git" }
+pamo = { path = "simp_cuda" }
+pamo-safe-project = { path = "simp_cuda/safe_project" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
