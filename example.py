@@ -15,7 +15,8 @@ def main():
     args.add_argument('-i', '--input', type=str, default='./mesh/BirdHouse_B019SXLRJ2_MetalLeafRoofGreenWalls_TU.obj')
     args.add_argument('-o', '--output', type=str, default='./BirdHouse_pamo.obj')
     args.add_argument('-r', '--ratio', type=float, default=0.1)
-    args.add_argument('-mv', '--min-vertex', type=int, default=0)
+    args.add_argument('-mf', '--min-faces', type=int, default=0,
+                      help='Floor on target face count (not vertex count)')
     args.add_argument('--disable_stage1', action='store_true', help="Disable remeshing")
     args.add_argument('--disable_stage3', action='store_true', help="Disable safe projection")
     args = args.parse_args()
@@ -31,7 +32,7 @@ def main():
     start = time.time()
     verts, faces = pamo.run(torch.from_numpy(input_mesh.vertices).float().cuda(), 
                             torch.from_numpy(input_mesh.faces).int().cuda(), 
-                            min_verts=args.min_vertex,
+                            min_faces=args.min_faces,
                             ratio = args.ratio)
     end = time.time()
     print("Total time: ", end-start)
